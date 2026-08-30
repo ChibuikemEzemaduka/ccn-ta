@@ -107,5 +107,14 @@ and restarts on failure, behind an nginx reverse proxy that handles HTTPS on
 port 443. See the Module Documentation for the service unit and proxy setup.
 
 ---
+File structure of the /materials/ folder should look like this (example shown only for 2026 but other years' directories could be added):
 
+├── materials
+│   ├── 2026    
+│   │   ├── handwritten_notes
+│   │   ├── homework_problems
+│   │   ├── homework_solutions
+│   │   ├── slides
+│   │   ├── textbook
+│   │   └── transcripts
 ```
