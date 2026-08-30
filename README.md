@@ -69,7 +69,7 @@ sudo apt install -y python3 python3-venv python3-pip python3-dev build-essential
 ### Step 2 — Clone the repository
 ```bash
 cd /path/to/deployment          # e.g. /home/<user>/
-git clone <REPOSITORY_URL> ccn-ta
+git clone https://github.com/ChibuikemEzemaduka/ccn-ta ccn-ta
 cd ccn-ta
 ```
 
