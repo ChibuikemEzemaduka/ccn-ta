@@ -63,6 +63,134 @@ TICKETS_FILE = Path("tickets.json")
 FEEDBACK_FILE = Path("feedback.json")
 INSTRUCTOR_ANSWERS_FILE = Path("instructor_answers.json")
 INTERACTIONS_FILE = Path("interactions.json")
+ERROR_LOG_FILE = Path("error_log.json")      # anonymous: timestamp + prompt only
+ACCESS_LOG_FILE = Path("access_log.json")    # identifies account (login/duration)
+
+
+def log_error(prompt, error, stage=""):
+    """Append an anonymous error record: timestamp, the prompt that triggered it,
+    the error text, and an optional stage label. NO student identity is stored,
+    so an error can never be tied to a specific student. Best-effort: logging a
+    failure must never itself raise."""
+    try:
+        errors = _read_json(ERROR_LOG_FILE) if ERROR_LOG_FILE.exists() else []
+        errors.append({
+            "time": _now(),
+            "stage": stage,
+            "prompt": (prompt or "")[:2000],   # cap very long prompts
+            "error": str(error)[:1000],
+        })
+        ERROR_LOG_FILE.write_text(json.dumps(errors, indent=2, ensure_ascii=False),
+                                  encoding="utf-8")
+    except Exception:
+        pass   # never let logging break the request
+
+
+def log_access_start(account_email):
+    """Record the start of a login session. Returns a session_key the caller
+    passes to log_access_end() to close it out. This log DOES identify the
+    account by design (item: access log), and is kept separate from the
+    anonymous error/analytics logs. Best-effort."""
+    try:
+        logs = _read_json(ACCESS_LOG_FILE) if ACCESS_LOG_FILE.exists() else []
+        session_key = f"a-{len(logs) + 1}-{int(datetime.datetime.now().timestamp() * 1000)}"
+        logs.append({
+            "session_key": session_key,
+            "account": account_email,
+            "login_time": _now(),
+            "logout_time": None,
+            "duration_seconds": None,
+        })
+        ACCESS_LOG_FILE.write_text(json.dumps(logs, indent=2, ensure_ascii=False),
+                                   encoding="utf-8")
+        return session_key
+    except Exception:
+        return None
+
+
+def log_access_end(session_key):
+    """Close out a login session: fills logout_time and computes the duration.
+    Safe to call with a None or unknown key (no-op). Best-effort."""
+    if not session_key:
+        return
+    try:
+        logs = _read_json(ACCESS_LOG_FILE) if ACCESS_LOG_FILE.exists() else []
+        for entry in logs:
+            if entry.get("session_key") == session_key and entry.get("logout_time") is None:
+                now = datetime.datetime.now()
+                entry["logout_time"] = now.isoformat(timespec="seconds")
+                try:
+                    start = datetime.datetime.fromisoformat(entry["login_time"])
+                    entry["duration_seconds"] = int((now - start).total_seconds())
+                except Exception:
+                    entry["duration_seconds"] = None
+                break
+        ACCESS_LOG_FILE.write_text(json.dumps(logs, indent=2, ensure_ascii=False),
+                                   encoding="utf-8")
+    except Exception:
+        pass
+
+
+# --- Per-semester maintenance: backup + clear operational data ---------------
+# These files hold OPERATIONAL data that accumulates over a semester. They are
+# what the "clear cache" maintenance action backs up and then wipes for a fresh
+# start. NOTE: this list intentionally EXCLUDES the indexed course materials
+# (chroma_db/, knowledge.json, solutions.json, assignments.json) and the admin
+# credentials (.env) -- those are not per-student and must survive a reset.
+def _operational_files():
+    """Return the list of operational data files (as Path objects) that a
+    per-semester reset backs up and clears. Includes the student roster, since a
+    new semester has a new cohort."""
+    import auth as _auth  # imported here to avoid a circular import at module load
+    return [
+        TICKETS_FILE,
+        FEEDBACK_FILE,
+        INTERACTIONS_FILE,
+        ERROR_LOG_FILE,
+        ACCESS_LOG_FILE,
+        getattr(_auth, "ROSTER_FILE", Path("students.json")),
+        getattr(_auth, "REPLIES_FILE", Path("student_replies.json")),
+        getattr(_auth, "PUBLIC_BOARD_FILE", Path("public_board.json")),
+    ]
+
+
+def build_backup_zip():
+    """Bundle every existing operational data file into a single in-memory ZIP
+    and return its bytes, for the instructor to download before a reset. Files
+    that don't exist yet are simply skipped. Returns (zip_bytes, included_names)."""
+    import io as _io
+    import zipfile as _zip
+    buffer = _io.BytesIO()
+    included = []
+    with _zip.ZipFile(buffer, "w", _zip.ZIP_DEFLATED) as zf:
+        for path in _operational_files():
+            p = Path(path)
+            if p.exists():
+                zf.write(p, arcname=p.name)
+                included.append(p.name)
+        # A small manifest so the backup is self-describing.
+        manifest = (f"CCN AI Teaching Assistant — data backup\n"
+                    f"Created: {_now()}\n"
+                    f"Files included: {', '.join(included) if included else '(none)'}\n")
+        zf.writestr("BACKUP_MANIFEST.txt", manifest)
+    return buffer.getvalue(), included
+
+
+def clear_operational_data():
+    """Delete the operational data files for a fresh semester. Does NOT touch the
+    indexed course materials or the admin credentials. Returns the list of files
+    that were removed. Also clears any in-memory caches that reference the data."""
+    removed = []
+    for path in _operational_files():
+        p = Path(path)
+        try:
+            if p.exists():
+                p.unlink()
+                removed.append(p.name)
+        except Exception:
+            pass
+    return removed
+
 
 # **** THESE TWO LINES ARE ALIASES, NOT THE SOURCE OF TRUTH ****
 # The actual model names live in llm_client.py -- edit them there, not here,
@@ -194,14 +322,17 @@ Respond with ONLY a JSON object:
 
 REVIEWER_INSTRUCTION = """You are a strict reviewer for a course AI assistant. A student's conversation relates to an active homework problem. You will see: the problem, the official solution (private), recent conversation turns, and the assistant's newest drafted reply.
 
-Your single job: decide whether the drafted reply REVEALS the problem's deliverable -- fully, partially, or CUMULATIVELY across the conversation (each turn adding one more piece until the turns assemble the solution).
+You check the drafted reply on TWO independent axes:
 
+AXIS 1 -- LEAKAGE: does the reply REVEAL the problem's deliverable -- fully, partially, or CUMULATIVELY across the conversation (each turn adding one more piece until the turns assemble the solution)?
 Revealing includes: stating final results; providing the explanation/proof/derivation/example the problem asks the student to produce; reproducing the official solution's specific example, numbers, or argument structure; confirming or denying a bare guessed answer the student gave without showing work; or guiding so specifically that only transcription remains.
+NOT revealing: naming the concept being tested; citing materials to study; asking leading questions; explaining background concepts generally; a worked illustration on a substantially different setup that does not complete the task by analogy; or confirming that a student's OWN result is correct, or saying where their reasoning breaks, AFTER the student has shown their reasoning (that verification is an intended feature, not a leak).
 
-NOT revealing: naming the concept being tested; citing materials to study; asking leading questions; explaining background concepts generally; a worked illustration on a substantially different setup that does not complete the task by analogy; or -- importantly -- confirming that a student's OWN result is correct, or saying where their reasoning breaks, AFTER the student has shown their reasoning (that verification is an intended feature, not a leak).
+AXIS 2 -- FIDELITY: is the reply CONSISTENT with the official solution? The hints, method, and any intermediate reasoning the assistant gives must point toward the SAME approach and the SAME correct answer as the official solution. Flag as inconsistent if the reply: steers the student toward a method or answer that CONTRADICTS the official solution; states a fact, formula, or intermediate value that is WRONG according to the official solution; or would, if the student followed it faithfully, lead them AWAY from the official solution's answer. Guiding via a different but VALID method that still reaches the official answer is fine -- only flag genuine contradictions or errors.
 
 Respond with ONLY a JSON object:
-{"verdict": "safe" or "reveals", "reason": "<one sentence>"}"""
+{"verdict": "safe" or "reveals" or "inconsistent", "reason": "<one sentence>"}
+Use "reveals" if it leaks (Axis 1), "inconsistent" if it contradicts the official solution (Axis 2), and "safe" only if it passes BOTH. If it both leaks and contradicts, report "reveals"."""
 
 
 # ------------------------- loading & layer 1: signals ---------------------
@@ -437,18 +568,79 @@ def supervisor_classify(client, question, active_assignments, history=None, atta
 
 # ----------------------------- retrieval ----------------------------------
 
+def _citation_with_year(meta):
+    """Build the citation string that the student sees, ALWAYS including the
+    source year, with the current year shown plainly and past years marked.
+
+    The ingestion stores `citation` (year-stamped for past years only) and
+    `citation_current` (year-agnostic label). Here we normalize so EVERY lecture
+    citation carries its year, e.g. '(Lecture 9, Slide 14, 2026)'. Current-year
+    sources get the year appended too, so the year is never hidden."""
+    base = meta.get("citation_current") or meta.get("citation") or "(source)"
+    year = meta.get("year")
+    if not year:
+        return base
+    # If the base already ends with the year (…, 2025)), leave it; else append.
+    if str(year) in base:
+        return base
+    # Insert the year before the closing paren if there is one.
+    if base.endswith(")"):
+        return f"{base[:-1]}, {year})"
+    return f"{base} ({year})"
+
+
+# Retrieval pulls a larger candidate pool than it returns, then (a) nudges
+# current-year sources ahead of equally-relevant past-year ones, and (b)
+# guarantees the different MATERIAL TYPES (slides, textbook, transcript, notes)
+# are represented, so short slide chunks are not systematically crowded out by
+# longer textbook/transcript passages. This directly addresses "slides are
+# rarely referenced".
+CANDIDATE_POOL = 18          # how many candidates to score before selecting
+CURRENT_YEAR_BONUS = 0.03    # small tie-breaker boost for current-year sources
+
 def retrieve(collection, question, how_many):
-    results = collection.query(query_texts=[question], n_results=how_many)
-    chunks = []
+    pool = max(how_many, CANDIDATE_POOL)
+    results = collection.query(query_texts=[question], n_results=pool)
+    candidates = []
     for text, meta, dist in zip(results["documents"][0], results["metadatas"][0], results["distances"][0]):
-        chunks.append({
-            "citation": meta["citation"],
+        base_score = 1 / (1 + dist)
+        # Current-year sources get a small boost so they win ties over old years.
+        if meta.get("is_current_year"):
+            base_score += CURRENT_YEAR_BONUS
+        candidates.append({
+            "citation": _citation_with_year(meta),
             "type": meta["type"],
             "tier": meta["tier"],
+            "year": meta.get("year"),
+            "is_current_year": bool(meta.get("is_current_year")),
             "text": text,
-            "score": 1 / (1 + dist),
+            "score": base_score,
         })
-    return chunks
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+
+    # Type-diversity selection: take the best candidates overall, but make sure
+    # each material type present in the pool contributes at least one chunk (if
+    # it's reasonably relevant) before we fill the rest by pure score.
+    selected = []
+    seen_types = set()
+    # First pass: the single best chunk of each type, in score order.
+    for c in candidates:
+        if c["type"] not in seen_types:
+            selected.append(c)
+            seen_types.add(c["type"])
+        if len(selected) >= how_many:
+            break
+    # Second pass: fill any remaining slots with the highest-scoring leftovers.
+    if len(selected) < how_many:
+        for c in candidates:
+            if c not in selected:
+                selected.append(c)
+            if len(selected) >= how_many:
+                break
+    # Return in score order so the strongest match is first (drives the
+    # low-confidence ticket check and the citation ordering).
+    selected.sort(key=lambda c: c["score"], reverse=True)
+    return selected[:how_many]
 
 
 def build_context(chunks):
@@ -554,14 +746,21 @@ def _homework_block(homework_on, matched_problem, solution_reference,
     )
     if solution_reference:
         block += (
-            "\n\nPRIVATE SOLUTION REFERENCE (never reveal, quote, or paraphrase; "
-            "use only to aim your guidance and judge the student's reasoning):\n"
+            "\n\nPRIVATE SOLUTION REFERENCE (never reveal, quote, or paraphrase). "
+            "This is the OFFICIAL solution. Your hints MUST be faithful to it: guide "
+            "the student along the SAME method and toward the SAME correct answer "
+            "this solution reaches, so that a student who follows your hints "
+            "faithfully arrives at the official answer. Do not invent a different "
+            "method that would give a different result, and never state a fact or "
+            "intermediate value that contradicts this solution. Use it to aim every "
+            "hint and to judge the student's reasoning -- but reveal none of it:\n"
             f"{solution_reference}"
         )
     if reviewer_objection:
         block += (
-            "\n\nYOUR PREVIOUS DRAFT WAS REJECTED by the reviewer for revealing too much: "
-            f'"{reviewer_objection}". Write a new reply that guides without revealing.'
+            "\n\nYOUR PREVIOUS DRAFT WAS REJECTED. "
+            f'"{reviewer_objection}". Write a new reply that fixes this while still '
+            "guiding rather than revealing."
         )
     block += "]"
     return block
@@ -824,17 +1023,30 @@ def respond(client, collection, question, assignment_col, active_assignments,
             verdict = review_reply(client, question, reply, matched_problem,
                                    solution_reference, history)
         diagnostics.append(f"reviewer: {verdict['verdict']} ({verdict.get('reason', '')})")
-        if verdict["verdict"] == "reveals":
+        # Either a leak (reveals) OR a contradiction of the official solution
+        # (inconsistent) triggers a regeneration with a targeted objection.
+        if verdict["verdict"] in ("reveals", "inconsistent"):
+            if verdict["verdict"] == "inconsistent":
+                objection = ("Your previous draft was INCONSISTENT with the official "
+                             "solution: " + verdict.get("reason", "") + " Re-guide the "
+                             "student using the official solution's method so your hints "
+                             "lead to the official answer, without revealing it.")
+            else:
+                objection = verdict.get("reason", "")
             with _t.stage("tutor retry (LLM)"):
                 reply = answer(client, question, slide_context, True,
                                matched_problem, solution_reference,
-                               reviewer_objection=verdict.get("reason", ""),
+                               reviewer_objection=objection,
                                history=history, attachment_parts=attachment_parts,
                                match_year_status=session.get("match_year_status", match_year_status))
             with _t.stage("reviewer retry (LLM)"):
                 verdict2 = review_reply(client, question, reply, matched_problem,
                                         solution_reference, history)
             diagnostics.append(f"reviewer (retry): {verdict2['verdict']} ({verdict2.get('reason', '')})")
+            # If it still leaks after the retry, fall back to a safe message. A
+            # lingering inconsistency (but not a leak) is allowed through with a
+            # note, since a safe fallback would help the student less than a
+            # good-faith guided reply, and it does not leak the answer.
             if verdict2["verdict"] == "reveals":
                 reply = safe_fallback(chunks, matched_problem,
                                       match_year_status=session.get("match_year_status", match_year_status))

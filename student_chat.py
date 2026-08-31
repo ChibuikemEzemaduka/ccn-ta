@@ -20,6 +20,12 @@ theme.render_header("STUDENT")
 auth.require_login()   # renders login form and calls st.stop() if not logged in
 student = auth.current_student()  # {'student_id', 'name', 'email'}
 
+# Record the start of this login session in the access log (identifies the
+# account, by design). Done once per session; the key is held in session_state
+# so a page rerun doesn't create duplicate entries.
+if "access_session_key" not in st.session_state:
+    st.session_state.access_session_key = ask.log_access_start(student["email"])
+
 # ---- 2. LLM connectivity check --------------------------------------------
 @st.cache_resource
 def get_collection():
@@ -27,7 +33,14 @@ def get_collection():
     chroma = chromadb.PersistentClient(path=ask.DB_FOLDER)
     return chroma.get_collection(ask.COLLECTION_NAME)
 
-collection = get_collection()
+try:
+    collection = get_collection()
+except Exception as _err:
+    print(f"=== BACKEND: could not open knowledge index: {_err}. "
+          f"Run 'python ingest.py' then 'python build_index.py'. ===", flush=True)
+    st.warning("⚠️ The assistant is temporarily unavailable. Please try again in a "
+               "few minutes.")
+    st.stop()
 
 # Active assignments are loaded fresh every run (cheap JSON read) so newly
 # uploaded/toggled homework takes effect immediately. The match index (an
@@ -46,16 +59,22 @@ assignment_col = _build_match_index(_fp, active_assignments) if active_assignmen
 
 ok, info = llm_client.check_connection()
 if not ok:
-    where = "Ollama Cloud" if getattr(llm_client, "USE_CLOUD", False) else "the local model server (Ollama)"
-    st.error(f"Can't reach {where} at {llm_client.OLLAMA_BASE_URL}. ({info})")
+    # Detailed reason to the terminal for the instructor/IT; generic to students.
+    print(f"=== BACKEND: cannot reach model server at {llm_client.OLLAMA_BASE_URL}: "
+          f"{info} ===", flush=True)
+    ask.log_error("(startup connectivity check)", info, stage="connectivity")
+    st.warning("⚠️ The assistant is temporarily unavailable. Please try again in a "
+               "few minutes.")
     st.stop()
 # The "is the model pulled?" check only makes sense for LOCAL Ollama, where
 # models live in your machine's /api/tags list. On Ollama Cloud the model runs
 # server-side and never appears in that list, so we skip the check there --
 # an invalid cloud model name will surface as a clear error on the first call.
 if not getattr(llm_client, "USE_CLOUD", False) and llm_client.TUTOR_MODEL not in info:
-    st.error(f"Ollama is running but '{llm_client.TUTOR_MODEL}' isn't pulled yet. "
-             f"Run: ollama pull {llm_client.TUTOR_MODEL}")
+    print(f"=== BACKEND: model '{llm_client.TUTOR_MODEL}' not pulled. "
+          f"Run: ollama pull {llm_client.TUTOR_MODEL} ===", flush=True)
+    st.warning("⚠️ The assistant is temporarily unavailable. Please try again in a "
+               "few minutes.")
     st.stop()
 
 client = llm_client
@@ -66,8 +85,26 @@ with st.sidebar:
     st.caption(f"Signed in as **{student['name']}**")
     st.caption(student['email'])
     if st.button("Sign out", width='stretch'):
+        # Close out the access-log session (records logout time + duration).
+        ask.log_access_end(st.session_state.pop("access_session_key", None))
         auth.logout()
         st.rerun()
+
+    # ---- Change password ---------------------------------------------------
+    with st.expander("🔑 Change password"):
+        cur_pw = st.text_input("Current password", type="password", key="cp_current")
+        new_pw = st.text_input("New password (min 8 characters)", type="password", key="cp_new")
+        new_pw2 = st.text_input("Confirm new password", type="password", key="cp_confirm")
+        if st.button("Update password", key="cp_submit", width='stretch'):
+            if new_pw != new_pw2:
+                st.error("The new passwords do not match.")
+            else:
+                ok, msg = auth.change_own_password(student['email'], cur_pw, new_pw)
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(msg)
+
     st.divider()
     if st.button("🔄 New conversation", width='stretch'):
         for k in ["messages","guard_session","session_phase",
@@ -391,7 +428,13 @@ if phase == "thinking":
     # Stream the reply live inside an assistant bubble. For non-homework
     # questions this shows tokens as they generate; homework questions are
     # fully vetted first inside respond_stream() and arrive in one piece.
+    #
+    # Any backend error (model overload, network issue, etc.) is caught here: the
+    # full detail is printed to the terminal and written to the anonymous error
+    # log, while the student sees only a friendly generic message -- never a raw
+    # traceback or server error text.
     final = {}
+    inference_error = None
     def _token_stream():
         for item in ask.respond_stream(client, collection, question, assignment_col,
                                        active_assignments, history,
@@ -404,10 +447,32 @@ if phase == "thinking":
                 yield item
 
     with st.chat_message("assistant"):
-        st.write_stream(_token_stream)
+        try:
+            st.write_stream(_token_stream)
+        except Exception as err:
+            inference_error = err
+            # Full detail to the backend terminal (for the instructor/IT only).
+            import traceback as _tb
+            print("=== BACKEND ERROR during student inference ===", flush=True)
+            _tb.print_exc()
+            # Anonymous record: prompt + error, NO student identity.
+            ask.log_error(question, err, stage="student_inference")
+            # Generic, reassuring message for the student.
+            st.warning("⚠️ The assistant is experiencing high demand right now and "
+                       "couldn't complete that request. Please wait a moment and try "
+                       "again.")
 
     # Clear the thinking indicator now that the reply is in.
     status_slot.empty()
+
+    # On error, discard this attempt cleanly and return to the input box so the
+    # student can retry, without recording a broken assistant message.
+    if inference_error is not None:
+        st.session_state.pending_inference = None
+        if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
+            st.session_state.messages.pop()
+        st.session_state.session_phase = st.session_state.pop("resume_phase", "ask")
+        st.stop()
 
     # If the student pressed Stop while the model was generating, honour it now:
     # discard the reply and the pending message, and return to the input box.

@@ -117,6 +117,26 @@ def reset_password(email: str, new_password: str):
     save_roster(students)
 
 
+def change_own_password(email: str, current_password: str, new_password: str):
+    """Let a logged-in student change their own password. Verifies the current
+    password first, then enforces an 8-character minimum on the new one.
+
+    Returns (ok, message). On success the roster is updated and (True, ...) is
+    returned; the caller keeps the student logged in (the session holds identity,
+    not the password, so no re-login is needed)."""
+    student = _lookup(email)
+    if not student:
+        return False, "Account not found."
+    if not _check_password(current_password, student["password_hash"]):
+        return False, "Your current password is incorrect."
+    if len(new_password) < 8:
+        return False, "New password must be at least 8 characters."
+    if new_password == current_password:
+        return False, "New password must be different from the current one."
+    reset_password(email, new_password)
+    return True, "Password changed successfully."
+
+
 def _lookup(email: str) -> dict | None:
     email = email.strip().lower()
     for s in load_roster():

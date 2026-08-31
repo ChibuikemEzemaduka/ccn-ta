@@ -84,9 +84,9 @@ if not st.session_state.instructor_authed:
 
 theme.render_header("TEACHING STAFF", role_color=theme.color("amber"))
 (tab_students, tab_tickets, tab_analytics,
- tab_homeworks, tab_upload, tab_variants) = st.tabs([
+ tab_homeworks, tab_upload, tab_variants, tab_maintenance) = st.tabs([
     "👥 Students", "🎫 Tickets", "📊 Analytics",
-    "✅ Active Homeworks", "📁 Upload Materials", "🧪 Generate",
+    "✅ Active Homeworks", "📁 Upload Materials", "🧪 Generate", "🧹 Maintenance",
 ])
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -1407,5 +1407,66 @@ with tab_variants:
             c2.download_button("⬇️ Answer key + hints", ws_kb,
                                f"{trace_name}_answer_key.docx",
                                "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB: MAINTENANCE  (per-semester data reset)
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_maintenance:
+    st.subheader("🧹 Clear module data for a new semester")
+    st.markdown(
+        "This clears the **operational data** that accumulates during a semester so "
+        "you can start fresh with a new cohort. It removes: the **student roster**, "
+        "**tickets**, **chat interaction logs**, **feedback**, **published board "
+        "items**, **staff replies**, and the **access and error logs**."
+    )
+    st.info("Your **course materials and the search index are NOT affected** — only "
+            "the per-semester student data is cleared. Your admin login also stays "
+            "the same.")
+
+    st.divider()
+    st.markdown("#### 1. Back up first (recommended)")
+    st.caption("Download a single ZIP of all current operational data before clearing. "
+               "Keep it somewhere safe in case you need the old semester's records.")
+    try:
+        zip_bytes, included = ask.build_backup_zip()
+        st.download_button(
+            "⬇️ Download backup (.zip)",
+            data=zip_bytes,
+            file_name=f"ccnta_backup_{_dt.datetime.now().strftime('%Y%m%d_%H%M')}.zip",
+            mime="application/zip",
+        )
+        st.caption(f"Backup will include: {', '.join(included) if included else 'no data files yet'}.")
+    except Exception as _e:
+        st.warning(f"Could not build the backup right now: {_e}")
+
+    st.divider()
+    st.markdown("#### 2. Clear the data")
+    st.warning("⚠️ **This permanently deletes all the operational data listed above.** "
+               "Students will need to be re-added for the new semester. This cannot be "
+               "undone — make sure you have downloaded a backup if you might need it.")
+
+    # Require the admin username + password again before clearing, as a
+    # deliberate second gate on a destructive action.
+    confirm_user = st.text_input("Re-enter admin username", key="maint_user")
+    confirm_pw = st.text_input("Re-enter admin password", type="password", key="maint_pw")
+    typed_phrase = st.text_input('Type CLEAR to confirm', key="maint_phrase")
+
+    if st.button("🗑️ Permanently clear all semester data", type="primary", key="maint_clear"):
+        if not _check_admin(confirm_user, confirm_pw):
+            st.error("Admin username or password is incorrect. Nothing was cleared.")
+        elif typed_phrase.strip().upper() != "CLEAR":
+            st.error('Please type CLEAR in the confirmation box. Nothing was cleared.')
+        else:
+            removed = ask.clear_operational_data()
+            # Drop any in-memory caches that referenced the cleared data.
+            try:
+                st.cache_resource.clear()
+            except Exception:
+                pass
+            if removed:
+                st.success(f"Cleared: {', '.join(removed)}. The module is ready for a "
+                           f"new semester. Add your new students in the 👥 Students tab.")
+            else:
+                st.info("There was no operational data to clear — everything was already empty.")
 
 theme.render_attribution()
