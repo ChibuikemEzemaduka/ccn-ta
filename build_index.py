@@ -126,12 +126,24 @@ def main(progress=_noop):
     documents, metadatas, ids = [], [], []
     for i, item in enumerate(knowledge):
         documents.append(item["text"])
-        metadatas.append({
+        # Carry ALL retrieval-relevant metadata into the index. Previously only
+        # citation/type/tier/source_file were copied, which silently dropped the
+        # year fields -- so citations couldn't show the year and current-year
+        # precedence couldn't work. ChromaDB rejects None metadata values, so we
+        # only include optional fields when present.
+        meta = {
             "citation": item["citation"],
             "type": item["type"],
             "tier": item["tier"],
             "source_file": item["source_file"],
-        })
+        }
+        if item.get("year") is not None:
+            meta["year"] = item["year"]
+        if item.get("is_current_year") is not None:
+            meta["is_current_year"] = bool(item["is_current_year"])
+        if item.get("citation_current"):
+            meta["citation_current"] = item["citation_current"]
+        metadatas.append(meta)
         ids.append(_stable_id("k", item, i))
     print(f"Indexing {len(documents)} knowledge chunks...")
     rebuild(client, "ccn_knowledge", documents, metadatas, ids, progress=progress)
