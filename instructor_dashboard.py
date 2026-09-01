@@ -260,7 +260,11 @@ with tab_tickets:
             # Student attribution
             if ticket.get("anonymous"):
                 student_label = "🔒 Anonymous"
-                can_reply_to_student = False
+                # We can still deliver a reply back to the student: the ticket
+                # keeps their internal student_id (not their name/email), so the
+                # reply routes to their account without the instructor knowing
+                # who they are.
+                can_reply_to_student = bool(ticket.get("student_id"))
             elif ticket.get("student_name"):
                 student_label = f"{ticket['student_name']} ({ticket.get('student_email','')})"
                 can_reply_to_student = bool(ticket.get("student_id"))
@@ -330,7 +334,10 @@ with tab_tickets:
                             ticket["id"], reply_text,
                             publish=st.session_state.get(pub_kb_key, True),
                         )
-                        # Post to student's account if they weren't anonymous
+                        # Deliver the reply to the student's account. This now
+                        # works for anonymous tickets too (we kept their
+                        # student_id to route the reply), while the instructor
+                        # still never sees their name or email.
                         if can_reply_to_student and st.session_state.get(f'notify_{ticket["id"]}', True):
                             auth.post_reply_to_student(
                                 ticket["student_id"], ticket["id"],

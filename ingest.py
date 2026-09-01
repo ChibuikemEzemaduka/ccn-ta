@@ -762,13 +762,23 @@ class _TextbookStructure:
             parts.append(f"Section {self.section_num}: {self.section_title}")
         return " | ".join(parts)
 
-    def citation(self, page_number: int) -> str:
-        """Human-readable citation for a chunk on this page."""
+    def citation(self, page_number: int = None) -> str:
+        """Human-readable citation for a chunk. We cite the CHAPTER and SECTION
+        (with its title, i.e. the topic) rather than a page number: the section
+        heading points the student straight to the relevant topic to study, and
+        -- unlike a page number -- it can't be thrown off by front-matter offsets
+        or edition differences. The page_number argument is accepted for
+        backward compatibility but no longer used."""
         if not self.chapter_num:
-            return f"(Textbook, p. {page_number})"
+            return "(Textbook)"
         if self.section_num:
-            return f"(Textbook, Ch.{self.chapter_num} §{self.section_num}, p. {page_number})"
-        return f"(Textbook, Ch.{self.chapter_num}, p. {page_number})"
+            if self.section_title:
+                return (f"(Textbook, Ch.{self.chapter_num} §{self.section_num}: "
+                        f"{self.section_title})")
+            return f"(Textbook, Ch.{self.chapter_num} §{self.section_num})"
+        if self.chapter_title:
+            return f"(Textbook, Ch.{self.chapter_num}: {self.chapter_title})"
+        return f"(Textbook, Ch.{self.chapter_num})"
 
     def page_is_explanatory(self, page_text: str) -> bool:
         """True if this page primarily contains explanatory content worth citing.
@@ -831,31 +841,16 @@ def _ingest_textbook(year_dir, year, knowledge, report=None, cache=None):
         skipped_pages = 0
         if path.suffix.lower() == ".pdf":
             structure = _TextbookStructure()
-            # Read ALL pages first so we can process in order for context tracking
+            # Read ALL pages so structure (chapter/section) is tracked in order.
             all_pages = read_pdf_pages(path, report)
-            # Determine the PDF-position -> printed-page offset for this book:
-            # use a configured value if present, else auto-detect it. This makes
-            # citations point to the PRINTED page number, not the PDF position.
-            if path.name in TEXTBOOK_PAGE_OFFSETS:
-                page_offset = TEXTBOOK_PAGE_OFFSETS[path.name]
-                print(f"      (using configured page offset {page_offset} for {path.name})")
-            else:
-                page_offset = _detect_page_offset(all_pages)
-                if page_offset:
-                    print(f"      (auto-detected page offset {page_offset} for {path.name} "
-                          f"-- printed page = PDF page - {page_offset})")
-                else:
-                    print(f"      (no page offset detected for {path.name}; citing PDF "
-                          f"page positions. If citations are off, set an offset in "
-                          f"TEXTBOOK_PAGE_OFFSETS.)")
             for page_number, page_text in all_pages:
                 structure.update(page_text)
                 if not structure.page_is_explanatory(page_text):
                     skipped_pages += 1
                     continue
                 prefix = structure.context_prefix()
-                printed_page = page_number - page_offset   # PDF position -> printed page
-                citation = structure.citation(printed_page)
+                # Cite the chapter/section (topic), not a page number.
+                citation = structure.citation()
                 for piece in chunk_text(page_text):
                     # Prepend structural context to the chunk text so embeddings
                     # carry chapter/section information. Prefix is separated by

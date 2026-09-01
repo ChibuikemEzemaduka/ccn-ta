@@ -1414,8 +1414,15 @@ def escalate_ticket(question, reason, source, shown_answer="", student_note="",
         "status": "open",
         "instructor_answer": None,
         "resolved_time": None,
-        # Student identity -- None when anonymous=True so no PII is stored
-        "student_id": None if anonymous else student_id,
+        # Student identity:
+        #   - student_id is ALWAYS stored (even when anonymous) so the ticket
+        #     still shows on the student's own page and the instructor's reply
+        #     can be routed back to them. It's an internal id, not a name/email,
+        #     so it does not reveal who the student is.
+        #   - name and email are hidden (None) when anonymous, so the instructor
+        #     genuinely cannot identify the student. The dashboard also respects
+        #     the `anonymous` flag and shows "Anonymous" regardless.
+        "student_id": student_id,
         "student_name": None if anonymous else student_name,
         "student_email": None if anonymous else student_email,
         "anonymous": anonymous,
@@ -1425,11 +1432,13 @@ def escalate_ticket(question, reason, source, shown_answer="", student_note="",
 
 
 def get_tickets_for_student(student_id):
-    """Return all tickets raised by this student (non-anonymous), newest first.
-    Includes both open (pending) and resolved tickets, each with its full stored
-    conversation and -- if resolved -- the instructor's answer. This is what
-    powers the student's own 'My escalated questions' view, so it never depends
-    on a notify checkbox: if the student escalated it, they can see it here."""
+    """Return all tickets raised by this student, newest first -- INCLUDING ones
+    they submitted anonymously (those keep the student_id so replies route back,
+    even though the instructor never sees the student's name/email). Includes both
+    open (pending) and resolved tickets, each with its full stored conversation
+    and -- if resolved -- the instructor's answer. This powers the student's own
+    'My escalated questions' view, so it never depends on a notify checkbox: if
+    the student escalated it, they can see it here."""
     if not student_id:
         return []
     mine = [t for t in load_tickets() if t.get("student_id") == student_id]
