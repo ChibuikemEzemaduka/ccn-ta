@@ -310,15 +310,16 @@ with tab_tickets:
                         # Post to anonymous class board if requested
                         if st.session_state.get(pub_board_key, False):
                             topic = st.session_state.get(topic_key, "")
-                            # The subquestion is the student's most recent note
-                            # written when they escalated (the specific thing
-                            # they were stuck on), shown on the board under the
-                            # main question.
                             notes = ticket.get("student_notes", [])
                             subq = notes[-1] if notes else ""
+                            # Generate the professional board title ONCE, now, at
+                            # publish time -- it's stored on the entry so the board
+                            # never regenerates it on subsequent views.
+                            board_title = ask.generate_board_title(
+                                llm_client, ticket["question"], reply_text)
                             auth.publish_to_board(ticket["id"], ticket["question"],
                                                   reply_text, topic=topic,
-                                                  subquestion=subq)
+                                                  subquestion=subq, title=board_title)
                         st.success(f"Resolved. {result}")
                         st.rerun()
 
@@ -399,6 +400,35 @@ with tab_analytics:
                 st.markdown(f'Re-explained: {c["reexplained_count"]}  ·  Escalated: {c["escalated_count"]}')
                 for q in c["sample_questions"]:
                     st.markdown(f"- {q}")
+
+    # ── Weekly LLM insights (sits alongside the clustering above) ────────────
+    st.divider()
+    _wh = st.columns([0.75, 0.25])
+    _wh[0].markdown("### 🗓️ Weekly insights")
+    _wh[0].caption("An LLM reads each calendar week's anonymous questions and "
+                   "summarizes what students asked most and where they struggled. "
+                   "Each week is generated once and stored, so it isn't recomputed "
+                   "on every visit.")
+    # "Generate now" regenerates the most recent week on demand.
+    _weeks_preview = ask._interactions_by_week()
+    _newest_key = _weeks_preview[0][0] if _weeks_preview else None
+    force = None
+    if _wh[1].button("🔄 Generate latest now", disabled=_newest_key is None):
+        force = _newest_key
+
+    with st.spinner("Preparing weekly insights…"):
+        weekly = ask.get_weekly_analytics(client, force_week=force)
+
+    if not weekly:
+        st.info("No weekly data yet — insights appear once students start asking questions.")
+    else:
+        for w in weekly:
+            with st.expander(f"**{w['label']}**  ·  {w['count']} question"
+                             f"{'s' if w['count'] != 1 else ''}",
+                             expanded=(w is weekly[0])):
+                st.markdown(w["summary"] or "_No summary available._")
+                if w.get("generated_at"):
+                    st.caption(f"Generated {w['generated_at']}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB: ACTIVE HOMEWORKS

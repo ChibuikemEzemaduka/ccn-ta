@@ -127,18 +127,90 @@ with st.sidebar:
         "**New conversation** clears the assistant's memory and starts fresh."
     )
 
-    # ---- Escalated questions status (full view is in the main area) -------
+    # ---- Escalated questions (professional sidebar dropdown) --------------
+    import datetime as _dt2
+
+    def _fmt_ticket_time(ts):
+        try:
+            return _dt2.datetime.fromisoformat(ts).strftime("%b %d, %I:%M %p")
+        except Exception:
+            return ts or ""
+
+    # Apply any reopen submitted on the previous run (button staged it).
+    _reopen_tid = st.session_state.pop("_do_reopen_ticket", None)
+    if _reopen_tid:
+        _reopen_msg = st.session_state.pop("_do_reopen_msg", "").strip()
+        if _reopen_msg:
+            ask.reopen_ticket(_reopen_tid, _reopen_msg)
+            st.session_state["_reopen_flash"] = True
+
     my_tickets = ask.get_tickets_for_student(student['student_id'])
     if my_tickets:
-        pending = [t for t in my_tickets if t.get("status") != "resolved"]
-        resolved = [t for t in my_tickets if t.get("status") == "resolved"]
-        # Count newly-resolved (unread) replies to nudge the student
+        _active = [t for t in my_tickets if t.get("status") in ("open", "reopened")]
+        _answered = [t for t in my_tickets if t.get("status") == "resolved"]
         unread = sum(1 for r in auth.get_student_replies(student['student_id']) if not r['read'])
+
         st.divider()
-        st.markdown("**🎫 Your escalated questions**")
-        st.caption(f"{len(pending)} pending · {len(resolved)} answered"
-                   + (f" · {unread} new reply" + ("s" if unread != 1 else "") if unread else ""))
-        st.caption("See details in the **My escalated questions** panel above the chat.")
+        _hdr = "🎫 My escalated questions"
+        if unread:
+            _hdr += f"  ({unread} new)"
+        with st.expander(_hdr, expanded=bool(unread) or st.session_state.pop("_reopen_flash", False)):
+            auth.mark_replies_read(student['student_id'])
+            st.caption(f"{len(_active)} awaiting reply · {len(_answered)} answered")
+
+            def _thread_block(t):
+                thread = ask._thread_for_display(t)
+                if not thread:
+                    return
+                for msg in thread:
+                    who = "You" if msg["role"] == "student" else "Teaching staff"
+                    st.markdown(f"<div style='font-size:0.85em;margin:2px 0'>"
+                                f"<b>{who}:</b> {msg['content']}</div>",
+                                unsafe_allow_html=True)
+
+            if _answered:
+                st.markdown("**Answered**")
+                for t in _answered:
+                    with st.container(border=True):
+                        st.markdown(
+                            "<span style='background:#1E7A34;color:#fff;padding:1px 7px;"
+                            "border-radius:10px;font-size:0.72em;'>ANSWERED</span>",
+                            unsafe_allow_html=True)
+                        st.markdown(f"<div style='font-size:0.9em;margin-top:4px'>"
+                                    f"{t['question']}</div>", unsafe_allow_html=True)
+                        st.caption(f"Answered {_fmt_ticket_time(t.get('resolved_time',''))}")
+                        with st.expander("View conversation"):
+                            _thread_block(t)
+                        with st.expander("Ask a follow-up"):
+                            rk = f"reopen_msg_{t['id']}"
+                            st.text_area("Your follow-up", key=rk, height=70,
+                                         placeholder="What's still unclear?",
+                                         label_visibility="collapsed")
+                            if st.button("Send & reopen", key=f"reopen_btn_{t['id']}",
+                                         width='stretch'):
+                                msg = st.session_state.get(rk, "").strip()
+                                if msg:
+                                    st.session_state["_do_reopen_ticket"] = t["id"]
+                                    st.session_state["_do_reopen_msg"] = msg
+                                    st.rerun()
+                                else:
+                                    st.warning("Type your follow-up first.")
+
+            if _active:
+                st.markdown("**Awaiting reply**")
+                for t in _active:
+                    reop = t.get("status") == "reopened"
+                    with st.container(border=True):
+                        st.markdown(
+                            "<span style='background:#B26A00;color:#fff;padding:1px 7px;"
+                            "border-radius:10px;font-size:0.72em;'>PENDING</span>",
+                            unsafe_allow_html=True)
+                        st.markdown(f"<div style='font-size:0.9em;margin-top:4px'>"
+                                    f"{t['question']}</div>", unsafe_allow_html=True)
+                        st.caption(f"Escalated {_fmt_ticket_time(t.get('time',''))}"
+                                   + (" · reopened" if reop else ""))
+                        with st.expander("View conversation"):
+                            _thread_block(t)
 
 # ---- 4. Session state ------------------------------------------------------
 if "messages" not in st.session_state:
@@ -216,102 +288,6 @@ if st.session_state.session_phase == "awaiting_rating":
         _mid = _msg_id(_j, _m)
         if f"flow_{_mid}" not in st.session_state:
             st.session_state[f"flow_{_mid}"] = {"stage": "rating"}
-
-# ---- 5b. My escalated questions panel -------------------------------------
-# Shows the student ALL their escalated tickets -- pending, reopened, and
-# answered -- each with the full threaded conversation. Answered tickets can be
-# REOPENED with a follow-up question if the student still doesn't understand.
-
-# Handle a reopen submission from a previous run (button sets these keys).
-_reopen_tid = st.session_state.pop("_do_reopen_ticket", None)
-if _reopen_tid:
-    _reopen_msg = st.session_state.pop("_do_reopen_msg", "").strip()
-    if _reopen_msg:
-        ask.reopen_ticket(_reopen_tid, _reopen_msg)
-        st.session_state["_reopen_flash"] = True
-
-_my_tickets = ask.get_tickets_for_student(student['student_id'])
-if _my_tickets:
-    # Active = still needs a staff reply (open or reopened). Answered = resolved.
-    _active = [t for t in _my_tickets if t.get("status") in ("open", "reopened")]
-    _answered = [t for t in _my_tickets if t.get("status") == "resolved"]
-    _unread = sum(1 for r in auth.get_student_replies(student['student_id']) if not r['read'])
-    _label = f"🎫 My escalated questions — {len(_active)} awaiting reply, {len(_answered)} answered"
-    if _unread:
-        _label += f"  ·  {_unread} new reply" + ("s" if _unread != 1 else "")
-    with st.expander(_label, expanded=bool(_unread) or st.session_state.pop("_reopen_flash", False)):
-        auth.mark_replies_read(student['student_id'])
-        import datetime as _dt2
-
-        def _fmt(ts):
-            try:
-                return _dt2.datetime.fromisoformat(ts).strftime("%b %d, %I:%M %p")
-            except Exception:
-                return ts or ""
-
-        def _render_thread(t):
-            """Show the full back-and-forth (escalation note, replies, reopenings)."""
-            thread = ask._thread_for_display(t)
-            if not thread:
-                return
-            with st.container(border=True):
-                for msg in thread:
-                    role = "user" if msg["role"] == "student" else "assistant"
-                    who = "You" if msg["role"] == "student" else "Teaching staff"
-                    with st.chat_message(role):
-                        st.markdown(f"**{who}:** {msg['content']}")
-
-        if _answered:
-            st.markdown("##### ✅ Answered")
-            for t in _answered:
-                with st.container(border=True):
-                    st.markdown(f"**Q:** {t['question']}")
-                    st.caption(f"Escalated {_fmt(t.get('time',''))} · "
-                               f"answered {_fmt(t.get('resolved_time',''))}")
-                    if t.get("conversation"):
-                        with st.expander("View the assistant conversation that led here"):
-                            for turn in t["conversation"]:
-                                with st.chat_message(turn["role"]):
-                                    st.markdown(turn["content"])
-                    # Full ticket thread (all replies + any prior reopenings)
-                    _render_thread(t)
-                    # Reopen: ask a follow-up if still unclear
-                    with st.expander("Still don't understand? Ask a follow-up"):
-                        rk = f"reopen_msg_{t['id']}"
-                        st.text_area("Your follow-up question for the teaching staff",
-                                     key=rk, height=80,
-                                     placeholder="Explain what still isn't clear…")
-                        if st.button("↩️ Send follow-up & reopen", key=f"reopen_btn_{t['id']}"):
-                            msg = st.session_state.get(rk, "").strip()
-                            if msg:
-                                # Stage the reopen; it's applied at the top of the
-                                # next run. We do NOT clear the text box here --
-                                # Streamlit forbids writing a widget's key after
-                                # the widget exists, and it's unnecessary: once
-                                # reopened, this ticket moves to the "awaiting
-                                # reply" section and this box disappears anyway.
-                                st.session_state["_do_reopen_ticket"] = t["id"]
-                                st.session_state["_do_reopen_msg"] = msg
-                                st.rerun()
-                            else:
-                                st.warning("Type your follow-up question first.")
-
-        if _active:
-            st.markdown("##### ⏳ Awaiting a teaching staff reply")
-            for t in _active:
-                with st.container(border=True):
-                    reop = t.get("status") == "reopened"
-                    st.markdown(f"**Q:** {t['question']}")
-                    st.caption(f"Escalated {_fmt(t.get('time',''))}"
-                               + (" · reopened with a follow-up" if reop else "")
-                               + " · not yet answered")
-                    if t.get("conversation"):
-                        with st.expander("View the assistant conversation that led here"):
-                            for turn in t["conversation"]:
-                                with st.chat_message(turn["role"]):
-                                    st.markdown(turn["content"])
-                    _render_thread(t)
-    st.divider()
 
 # ---- 6. Conversation render -----------------------------------------------
 for i, message in enumerate(st.session_state.messages):

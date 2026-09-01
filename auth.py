@@ -54,13 +54,43 @@ SESSION_KEY = "ccnta_student"
 
 
 # ----------------------------- hashing ------------------------------------
+# Passwords are hashed with bcrypt, which salts each password automatically and
+# is deliberately slow, resisting brute-force and rainbow-table attacks. Older
+# accounts created before this upgrade were stored as unsalted SHA-256 hashes;
+# _check_password still validates those, and authenticate() transparently
+# re-hashes them to bcrypt on the next successful login (migration-on-login), so
+# no student is locked out and every account ends up on bcrypt over time.
+
+import bcrypt
+
+
+def _is_bcrypt_hash(stored_hash: str) -> bool:
+    """bcrypt hashes start with the version marker $2a$/$2b$/$2y$."""
+    return isinstance(stored_hash, str) and stored_hash.startswith(("$2a$", "$2b$", "$2y$"))
+
 
 def _hash_password(password: str) -> str:
+    """Hash a NEW password with bcrypt (salted + slow)."""
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def _legacy_sha256(password: str) -> str:
+    """The old unsalted SHA-256 scheme, kept only to validate pre-upgrade hashes."""
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 
 def _check_password(plain: str, stored_hash: str) -> bool:
-    return _hash_password(plain) == stored_hash
+    """Verify a password against either a bcrypt hash (new) or a legacy SHA-256
+    hash (old accounts). Format is detected from the stored hash."""
+    if not stored_hash:
+        return False
+    if _is_bcrypt_hash(stored_hash):
+        try:
+            return bcrypt.checkpw(plain.encode("utf-8"), stored_hash.encode("utf-8"))
+        except (ValueError, TypeError):
+            return False
+    # Legacy unsalted SHA-256 hash.
+    return _legacy_sha256(plain) == stored_hash
 
 
 # ----------------------------- roster -------------------------------------
@@ -148,9 +178,18 @@ def _lookup(email: str) -> dict | None:
 # ----------------------------- session ------------------------------------
 
 def authenticate(email: str, password: str) -> bool:
-    """Try to log the student in. Returns True on success."""
+    """Try to log the student in. Returns True on success.
+
+    If the account still has a legacy SHA-256 hash, upgrade it to bcrypt
+    transparently now that we've verified the plaintext password."""
     student = _lookup(email)
     if student and _check_password(password, student["password_hash"]):
+        # Migration-on-login: silently re-hash legacy passwords to bcrypt.
+        if not _is_bcrypt_hash(student.get("password_hash", "")):
+            try:
+                reset_password(student["email"], password)
+            except Exception:
+                pass   # never block a valid login on a migration hiccup
         st.session_state[SESSION_KEY] = {
             "student_id": student["student_id"],
             "name": student["name"],
@@ -268,24 +307,34 @@ def load_public_board() -> list:
 
 
 def publish_to_board(ticket_id: str, question: str, answer: str, topic: str = "",
-                     subquestion: str = ""):
+                     subquestion: str = "", title: str = ""):
     """Publish a resolved ticket to the anonymous public class board.
 
     question:    the MAIN question (the original triggering question).
     subquestion: the student's follow-up note written when they escalated to
                  the teaching staff (the more specific thing they were stuck on).
                  Shown separately on the board so readers see both the general
-                 topic and the specific point of confusion. May be empty."""
+                 topic and the specific point of confusion. May be empty.
+    title:       a short, professional heading for this entry (generated once by
+                 the LLM at publish time). Shown as the board item's header; the
+                 full question/answer live behind a dropdown."""
     board = load_public_board()
     board.insert(0, {
         "id": f"b-{len(board) + 1}",
         "ticket_id": ticket_id,
+        "title": title,
         "question": question,
         "subquestion": subquestion,
         "answer": answer,
         "topic": topic,
         "time": _now(),
     })
+    PUBLIC_BOARD_FILE.write_text(json.dumps(board, indent=2, ensure_ascii=False),
+                                 encoding="utf-8")
+
+
+def save_public_board(board: list):
+    """Persist the whole board list (used by the one-time title backfill)."""
     PUBLIC_BOARD_FILE.write_text(json.dumps(board, indent=2, ensure_ascii=False),
                                  encoding="utf-8")
 

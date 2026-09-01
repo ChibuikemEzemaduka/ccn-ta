@@ -1176,6 +1176,166 @@ def _now():
     return datetime.datetime.now().isoformat(timespec="seconds")
 
 
+WEEKLY_ANALYTICS_FILE = Path("weekly_analytics.json")
+
+
+def _week_key(iso_time):
+    """Return the ISO calendar-week key (e.g. '2026-W36') for a timestamp, and a
+    human label ('Week of Sep 01, 2026'). Weeks are Monday-Sunday calendar weeks."""
+    try:
+        dt = datetime.datetime.fromisoformat(iso_time)
+    except Exception:
+        return None, None
+    iso = dt.isocalendar()          # (year, week, weekday)
+    key = f"{iso[0]}-W{iso[1]:02d}"
+    monday = dt - datetime.timedelta(days=dt.weekday())
+    label = f"Week of {monday.strftime('%b %d, %Y')}"
+    return key, label
+
+
+def _interactions_by_week():
+    """Group all logged interactions into calendar weeks. Returns an ordered
+    dict-like list of (week_key, label, [interactions]) newest week first."""
+    interactions = _read_json(INTERACTIONS_FILE) if INTERACTIONS_FILE.exists() else []
+    buckets = {}
+    labels = {}
+    for it in interactions:
+        key, label = _week_key(it.get("time", ""))
+        if not key:
+            continue
+        buckets.setdefault(key, []).append(it)
+        labels[key] = label
+    weeks = sorted(buckets.keys(), reverse=True)
+    return [(k, labels[k], buckets[k]) for k in weeks]
+
+
+def _week_data_hash(items):
+    """A stable hash of a week's interactions, so a stored summary is reused
+    unless that week's data actually changed (new questions arrived)."""
+    import hashlib
+    basis = "|".join(sorted(it.get("id", "") for it in items))
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
+
+
+def _load_weekly_cache():
+    return _read_json(WEEKLY_ANALYTICS_FILE) if WEEKLY_ANALYTICS_FILE.exists() else {}
+
+
+def _save_weekly_cache(cache):
+    try:
+        WEEKLY_ANALYTICS_FILE.write_text(json.dumps(cache, indent=2, ensure_ascii=False),
+                                         encoding="utf-8")
+    except Exception:
+        pass
+
+
+def generate_weekly_summary(client, items):
+    """Ask the LLM to read a week's (anonymous) questions and produce a short
+    narrative insight: what students asked most, which topics confused them, and
+    where they spent the most effort. Reads ONLY the anonymous interaction log
+    (questions + whether the module flagged/homework), never student identity.
+
+    Returns a markdown string."""
+    # Build a compact, anonymous digest of the week's questions for the model.
+    lines = []
+    for it in items[:400]:   # cap to keep the prompt bounded
+        tag = []
+        if it.get("homework_on"):
+            tag.append("homework")
+        if it.get("flagged"):
+            tag.append("low-coverage")
+        suffix = f" [{', '.join(tag)}]" if tag else ""
+        q = (it.get("question", "") or "").replace("\n", " ").strip()
+        if q:
+            lines.append(f"- {q[:200]}{suffix}")
+    digest = "\n".join(lines) if lines else "(no questions this week)"
+
+    instruction = (
+        "You are an analytics assistant for a university Computer Communication "
+        "Networks course. You are given an ANONYMOUS list of the questions "
+        "students asked the course AI assistant in one week (no student identity). "
+        "Write a concise, professional weekly insight for the instructor with these "
+        "sections as short markdown:\n"
+        "**Most asked topics** — the themes that came up most.\n"
+        "**Where students struggled most** — topics with confusion or repeated / "
+        "low-coverage / homework-related questions.\n"
+        "**Suggested focus** — one or two brief, concrete suggestions for the "
+        "instructor (e.g. revisit a concept, add an example).\n\n"
+        "Be specific to the actual questions. Keep the whole thing under ~200 "
+        "words. Do not list every question; synthesize. Do not invent data.")
+    prompt = f"This week's student questions:\n{digest}"
+    try:
+        contents = [{"role": "user", "text": prompt}]
+        return client.generate(MODEL, instruction, contents, temperature=0.3).strip()
+    except Exception as e:
+        return f"_Could not generate the weekly summary right now ({e})._"
+
+
+def get_weekly_analytics(client, force_week=None):
+    """Return per-week analytics, generating each week's LLM summary at most once
+    per data set. The summary for a week is (re)generated only if that week has
+    no cached summary yet, OR its data hash changed (new questions arrived), OR
+    the caller forces it via force_week (the 'generate now' button).
+
+    Returns a list of dicts: {week_key, label, count, summary, generated_at}.
+    """
+    weeks = _interactions_by_week()
+    cache = _load_weekly_cache()
+    out = []
+    dirty = False
+    for key, label, items in weeks:
+        h = _week_data_hash(items)
+        cached = cache.get(key)
+        needs = (cached is None
+                 or cached.get("hash") != h
+                 or (force_week == key))
+        if needs:
+            summary = generate_weekly_summary(client, items)
+            cache[key] = {"hash": h, "summary": summary,
+                          "label": label, "count": len(items),
+                          "generated_at": _now()}
+            dirty = True
+        entry = cache[key]
+        out.append({"week_key": key, "label": entry.get("label", label),
+                    "count": entry.get("count", len(items)),
+                    "summary": entry.get("summary", ""),
+                    "generated_at": entry.get("generated_at", "")})
+    if dirty:
+        _save_weekly_cache(cache)
+    return out
+
+
+def generate_board_title(client, question, answer):
+    """Produce a short, professional title (a topic heading) for a class-board
+    Q&A entry, using the LLM. Called ONCE when the item is published (or once
+    during a one-time backfill of old items), then stored on the entry so it is
+    never regenerated on subsequent board views.
+
+    Returns a concise title string (falls back to a trimmed question on any
+    error, so the board always has something to show)."""
+    instruction = (
+        "You write concise, professional topic titles for a computer-networks "
+        "course Q&A board. Given a student's question and the teaching staff's "
+        "answer, produce a SHORT title (at most about 10 words) that captures the "
+        "topic, as a heading a student could scan. Use sentence case, no trailing "
+        "punctuation, no quotation marks. Do not answer the question; only title "
+        "it. Respond with ONLY the title text.")
+    prompt = f"QUESTION:\n{question}\n\nANSWER:\n{answer}\n\nTitle:"
+    try:
+        contents = [{"role": "user", "text": prompt}]
+        title = client.generate(GUARD_MODEL, instruction, contents,
+                                temperature=0.2,
+                                max_tokens=getattr(client, "GUARD_MAX_TOKENS", 256))
+        title = (title or "").strip().strip('"').strip()
+        if not title:
+            raise ValueError("empty title")
+        title = title.splitlines()[0].strip()
+        return title[:120]
+    except Exception:
+        q = (question or "Class question").strip().splitlines()[0]
+        return (q[:80] + "…") if len(q) > 80 else q
+
+
 def load_tickets():
     if TICKETS_FILE.exists():
         return _read_json(TICKETS_FILE)
