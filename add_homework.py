@@ -100,7 +100,43 @@ def hw_id_from_filename(filename: str) -> str:
     return f"HW{match.group(1)}" if match else Path(filename).stem
 
 
-# ----------------------------- two parsers --------------------------------
+# ----------------------------- three parsers ------------------------------
+# The chain, in order of preference:
+#   1. vision_split  — the model reads the PDF PAGE IMAGES directly, so it
+#      captures figures, tables, and layout that text extraction mangles.
+#   2. llm_split     — the model structures the pypdf-EXTRACTED text (no images).
+#   3. regex_split   — offline heading split.
+#   4. whole-file    — last resort.
+
+def vision_split(path: Path, client):
+    """FIRST CHOICE for PDFs: have the vision model read the actual page images
+    of the homework and return structured problems as JSON. Captures figures and
+    layout, not just extractable text. Returns None on any failure (so the caller
+    falls through to the text-based parsers) or for non-PDF files."""
+    if path.suffix.lower() != ".pdf":
+        return None
+    if not getattr(client, "MODEL_SUPPORTS_VISION", False):
+        return None
+    try:
+        pdf_bytes = path.read_bytes()
+        contents = [{
+            "role": "user",
+            "text": ("The attached PDF is a university homework. Read the PAGES "
+                     "(including any figures, diagrams, and tables) and return the "
+                     "problems."),
+            "attachments": [{"bytes": pdf_bytes, "mime_type": "application/pdf"}],
+        }]
+        reply_text = client.generate(
+            client.TUTOR_MODEL, PARSER_INSTRUCTION, contents,
+            temperature=0.0, json_mode=True,
+        )
+        problems = json.loads(reply_text)
+        if isinstance(problems, list) and all("number" in p and "text" in p for p in problems):
+            return [(int(p["number"]), p["text"].strip()) for p in problems]
+    except Exception as error:
+        print(f"    (vision parse failed: {error})")
+    return None
+
 
 def llm_split(text: str, client):
     """Ask the LLM to return the problems as clean JSON. None on any failure."""
@@ -133,17 +169,26 @@ def regex_split(text: str):
 
 def entries_from_file(path: Path, client):
     hw_id = hw_id_from_filename(path.name)
-    text = read_text(path)
 
     problems, how = None, ""
+    # 1. Vision: read the PDF page images directly (captures figures/layout).
     if client is not None:
-        problems = llm_split(text, client)
-        how = "LLM-parsed"
+        problems = vision_split(path, client)
+        if problems is not None:
+            how = "vision-parsed"
+    # 2. LLM structuring of pypdf-extracted text.
+    if problems is None and client is not None:
+        problems = llm_split(read_text(path), client)
+        if problems is not None:
+            how = "LLM-parsed (text)"
+    # 3. Offline regex split.
     if problems is None:
-        problems = regex_split(text)
-        how = "regex fallback"
+        problems = regex_split(read_text(path))
+        if problems is not None:
+            how = "regex fallback"
+    # 4. Whole file as one problem.
     if problems is None:
-        problems = [(1, re.sub(r"\s+", " ", text).strip())]
+        problems = [(1, re.sub(r"\s+", " ", read_text(path)).strip())]
         how = "whole file (no headings found)"
 
     entries = [

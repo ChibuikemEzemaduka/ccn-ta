@@ -619,19 +619,32 @@ def retrieve(collection, question, how_many):
         })
     candidates.sort(key=lambda c: c["score"], reverse=True)
 
-    # Type-diversity selection: take the best candidates overall, but make sure
-    # each material type present in the pool contributes at least one chunk (if
-    # it's reasonably relevant) before we fill the rest by pure score.
+    # Type-diversity selection so no single material type crowds out the others.
+    # Two passes:
+    #   Pass 1 -- guarantee EACH type present in the pool contributes its single
+    #             best chunk, IF that chunk is reasonably relevant (within a
+    #             margin of the top score). This is what lets transcripts and
+    #             notes appear alongside slides/textbook even though slides and
+    #             textbook usually score a touch higher. Transcripts especially
+    #             share content with slides, so without this they get squeezed out.
+    #   Pass 2 -- fill remaining slots by pure score.
+    if not candidates:
+        return []
+    top_score = candidates[0]["score"]
+    RELEVANCE_MARGIN = 0.15   # a type's best chunk joins if within this of the top
+
     selected = []
     seen_types = set()
-    # First pass: the single best chunk of each type, in score order.
+    # Pass 1: best chunk of each type, in score order, if relevant enough.
     for c in candidates:
-        if c["type"] not in seen_types:
+        if c["type"] in seen_types:
+            continue
+        if c["score"] >= top_score - RELEVANCE_MARGIN:
             selected.append(c)
             seen_types.add(c["type"])
         if len(selected) >= how_many:
             break
-    # Second pass: fill any remaining slots with the highest-scoring leftovers.
+    # Pass 2: fill remaining slots with the highest-scoring leftovers.
     if len(selected) < how_many:
         for c in candidates:
             if c not in selected:

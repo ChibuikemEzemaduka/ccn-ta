@@ -154,6 +154,60 @@ def _refresh_year_globals():
 CHUNK_TARGET = 1100
 
 
+# ── Textbook page-number offset ───────────────────────────────────────────────
+# A textbook PDF's page POSITION (1st, 2nd, 3rd file page) is NOT the same as the
+# PRINTED page number in the book: front matter (cover, title, copyright, table
+# of contents, preface) comes before printed page 1. Without correcting for this,
+# every textbook citation is off by a constant amount, sending students to the
+# wrong page.
+#
+# The offset is: (PDF position of printed page 1) - 1.  E.g. if printed page 1 is
+# the 19th page of the PDF, the offset is 18, and printed_page = pdf_position - 18.
+#
+# Set it per textbook filename here if you know it. If a file isn't listed, the
+# code AUTO-DETECTS the offset by finding where printed page numbers begin in the
+# PDF (see _detect_page_offset); auto-detection falls back to 0 (no offset) if it
+# can't determine it confidently.
+TEXTBOOK_PAGE_OFFSETS = {
+    # "Textbook_KuroseRoss.pdf": 18,
+}
+
+
+def _detect_page_offset(all_pages):
+    """Best-effort: find the constant difference between a page's PDF position and
+    its PRINTED page number, by looking for a printed page number in each page's
+    text. Returns the most common (pdf_position - printed_number) difference, or
+    0 if it can't find enough agreement.
+
+    How it works: on a page whose PDF position is P, if we can read the printed
+    page number N from the page text, the offset is P - N. We collect these across
+    many pages and take the majority value -- robust to the occasional page where
+    a stray number is mistaken for the page number."""
+    import collections as _c
+    diffs = _c.Counter()
+    for pdf_pos, text in all_pages:
+        # Printed page numbers usually sit alone on the first or last line of a
+        # page. Check the first 2 and last 2 non-empty lines for a bare integer.
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        candidates = lines[:2] + lines[-2:]
+        for ln in candidates:
+            m = re.fullmatch(r"(\d{1,4})", ln)
+            if m:
+                printed = int(m.group(1))
+                # Ignore implausible matches (e.g. a year, a huge number).
+                if 1 <= printed <= len(all_pages) + 50:
+                    diffs[pdf_pos - printed] += 1
+                    break
+    if not diffs:
+        return 0
+    # Require the majority offset to appear on a reasonable number of pages,
+    # otherwise treat as undetected (offset 0) to avoid making things worse.
+    offset, count = diffs.most_common(1)[0]
+    if count >= max(3, len(all_pages) // 20):
+        return offset
+    return 0
+
+
 # ── Standard naming convention ────────────────────────────────────────────────
 # The module ONLY indexes files that follow these patterns. This lets the
 # instructor keep original downloaded files (e.g. ccn2025-lecture1.pptx) sitting
@@ -359,6 +413,84 @@ def read_full_text(path):
     if path.suffix.lower() == ".pdf":
         return "\n".join(text for _, text in read_pdf_pages(path))
     return path.read_text(encoding="utf-8", errors="replace")
+
+
+# Instruction for the LLM cleanup of homework SOLUTION text. It repairs the
+# damage PDF text-extraction does (broken lines, mangled math, lost structure)
+# without solving, summarising, or altering any values -- so the private
+# solution the tutor and reviewer rely on is as faithful and readable as
+# possible. Mirrors how homework PROBLEMS are structured by the LLM.
+SOLUTION_CLEANUP_INSTRUCTION = """You clean up the raw extracted text of a university homework SOLUTION document.
+
+Rules:
+- Repair extraction damage: rejoin broken lines, fix spacing, restore the structure of each solution part (Problem 1, part a, b, ...), and drop page headers/footers and course boilerplate.
+- PRESERVE every number, unit, symbol, equation, and final answer EXACTLY as written. Do not solve differently, recompute, shorten, or summarise anything. This is an official answer key; its values must stay identical.
+- Keep the solutions in their original order.
+- If a figure or diagram is referenced, keep the reference text; do not invent figure contents.
+
+Respond with ONLY the cleaned solution text (no preamble, no JSON, no commentary)."""
+
+
+def llm_clean_solution(text, client):
+    """Use the LLM to clean/repair extracted solution text. Returns the cleaned
+    text, or None on any failure so the caller can fall back to the raw text."""
+    if not text.strip():
+        return None
+    try:
+        cleaned = client.generate(
+            client.TUTOR_MODEL, SOLUTION_CLEANUP_INSTRUCTION,
+            [{"role": "user", "text": f"RAW SOLUTION TEXT:\n\n{text}"}],
+            temperature=0.0,
+        )
+        cleaned = (cleaned or "").strip()
+        return cleaned or None
+    except Exception as error:
+        print(f"      (LLM solution cleanup failed: {error})")
+        return None
+
+
+# Vision reading of a solution PDF: the model reads the actual PAGE IMAGES, so it
+# captures figures, diagrams, tables, and math layout that text extraction loses.
+# It is instructed to transcribe faithfully (this is an answer key) and to
+# describe any figures in words so the tutor/reviewer can use them.
+SOLUTION_VISION_INSTRUCTION = """You read the pages of a university homework SOLUTION document (an official answer key) and produce a faithful, readable text version of it.
+
+Rules:
+- Transcribe ALL solution content EXACTLY: every number, unit, symbol, equation, intermediate step, and final answer. Do not solve differently, recompute, shorten, or summarise. The values must stay identical to the page.
+- Keep the solutions in order, preserving each part's structure (Problem 1, part a, b, ...).
+- For any FIGURE, DIAGRAM, TABLE, or PLOT, include a clear textual description of what it shows (nodes/links/labels for a topology, axes/curve for a plot, rows/columns for a table) so a reader who cannot see the image still understands it.
+- Drop page headers/footers and course boilerplate.
+
+Output only the faithful solution text (with figure descriptions inline where they appear). No preamble, no commentary."""
+
+
+def vision_read_solution(path, client):
+    """FIRST CHOICE for solution PDFs: have the vision model read the page images
+    directly and return a faithful text version, including descriptions of any
+    figures. Returns the text, or None on any failure / for non-PDF files (so the
+    caller falls through to text extraction)."""
+    if path.suffix.lower() != ".pdf":
+        return None
+    if not getattr(client, "MODEL_SUPPORTS_VISION", False):
+        return None
+    try:
+        pdf_bytes = path.read_bytes()
+        contents = [{
+            "role": "user",
+            "text": ("The attached PDF is an official homework solution (answer "
+                     "key). Read the pages, including any figures, and produce the "
+                     "faithful text version."),
+            "attachments": [{"bytes": pdf_bytes, "mime_type": "application/pdf"}],
+        }]
+        out = client.generate(
+            client.TUTOR_MODEL, SOLUTION_VISION_INSTRUCTION, contents,
+            temperature=0.0,
+        )
+        out = (out or "").strip()
+        return out or None
+    except Exception as error:
+        print(f"      (vision solution read failed: {error})")
+        return None
 
 
 # ------------------------- transcript handling ---------------------------
@@ -701,13 +833,29 @@ def _ingest_textbook(year_dir, year, knowledge, report=None, cache=None):
             structure = _TextbookStructure()
             # Read ALL pages first so we can process in order for context tracking
             all_pages = read_pdf_pages(path, report)
+            # Determine the PDF-position -> printed-page offset for this book:
+            # use a configured value if present, else auto-detect it. This makes
+            # citations point to the PRINTED page number, not the PDF position.
+            if path.name in TEXTBOOK_PAGE_OFFSETS:
+                page_offset = TEXTBOOK_PAGE_OFFSETS[path.name]
+                print(f"      (using configured page offset {page_offset} for {path.name})")
+            else:
+                page_offset = _detect_page_offset(all_pages)
+                if page_offset:
+                    print(f"      (auto-detected page offset {page_offset} for {path.name} "
+                          f"-- printed page = PDF page - {page_offset})")
+                else:
+                    print(f"      (no page offset detected for {path.name}; citing PDF "
+                          f"page positions. If citations are off, set an offset in "
+                          f"TEXTBOOK_PAGE_OFFSETS.)")
             for page_number, page_text in all_pages:
                 structure.update(page_text)
                 if not structure.page_is_explanatory(page_text):
                     skipped_pages += 1
                     continue
                 prefix = structure.context_prefix()
-                citation = structure.citation(page_number)
+                printed_page = page_number - page_offset   # PDF position -> printed page
+                citation = structure.citation(printed_page)
                 for piece in chunk_text(page_text):
                     # Prepend structural context to the chunk text so embeddings
                     # carry chapter/section information. Prefix is separated by
@@ -755,7 +903,7 @@ def _ingest_textbook(year_dir, year, knowledge, report=None, cache=None):
             print(f"  textbook [{year or 'flat'}]: {len(pieces):>4} chunks from {path.name}")
 
 
-def _ingest_homework_solutions(year_dir, year, solutions, cache=None):
+def _ingest_homework_solutions(year_dir, year, solutions, cache=None, client=None):
     sol_dir = year_dir / "homework_solutions"
     if not sol_dir.exists():
         return
@@ -770,7 +918,25 @@ def _ingest_homework_solutions(year_dir, year, solutions, cache=None):
         hw_id = hw_id_from_filename(path.name)
         # Tag with year so the guard can apply Socratic mode regardless of year
         hw_id_with_year = f"{hw_id}-{year}" if year and not is_current else hw_id
-        pieces = chunk_text(read_full_text(path))
+
+        raw_text = read_full_text(path)
+        # Fallback chain for the answer key, in order of preference:
+        #   1. VISION — read the PDF page images directly (captures figures).
+        #   2. LLM cleanup of the pypdf-extracted text.
+        #   3. Raw extracted text (unchanged original behaviour).
+        how = "raw text"
+        solution_text = raw_text
+        if client is not None:
+            vision_out = vision_read_solution(path, client)
+            if vision_out:
+                solution_text = vision_out
+                how = "vision-read"
+            else:
+                cleaned = llm_clean_solution(raw_text, client)
+                if cleaned:
+                    solution_text = cleaned
+                    how = "LLM-cleaned (text)"
+        pieces = chunk_text(solution_text)
         for i, piece in enumerate(pieces, start=1):
             produced.append({
                 "hw_id": hw_id,           # base id (HW4) for vault lookup
@@ -782,7 +948,8 @@ def _ingest_homework_solutions(year_dir, year, solutions, cache=None):
         solutions.extend(produced)
         if cache:
             cache.put(path, "solutions", produced)
-        print(f"  SOLUTIONS [{year or 'flat'}]: {len(pieces):>4} chunks from {path.name} (private, {hw_id_with_year})")
+        print(f"  SOLUTIONS [{year or 'flat'}]: {len(pieces):>4} chunks from {path.name} "
+              f"(private, {hw_id_with_year}, {how})")
 
 
 def _deduplicate(knowledge):
@@ -863,13 +1030,24 @@ def main(incremental=True):
     # every file is parsed fresh.
     cache = ParseCache(enabled=incremental)
 
+    # LLM client for cleaning up homework-solution text (first choice). If it's
+    # unavailable, solution ingestion falls back to the raw extracted text.
+    sol_client = None
+    try:
+        import llm_client as _llm
+        ok, _ = _llm.check_connection()
+        if ok:
+            sol_client = _llm
+    except Exception:
+        sol_client = None
+
     for year, year_dir in _year_dirs():
         print(f"\n--- {'flat (current year)' if year is None else str(year)} ---")
         _ingest_slides(year_dir, year, knowledge, report, cache)
         _ingest_transcripts(year_dir, year, knowledge, cache)
         _ingest_notes(year_dir, year, knowledge, report, cache)
         _ingest_textbook(year_dir, year, knowledge, report, cache)
-        _ingest_homework_solutions(year_dir, year, solutions, cache)
+        _ingest_homework_solutions(year_dir, year, solutions, cache, client=sol_client)
 
     # Instructor-approved answers (tier 2, always current)
     if INSTRUCTOR_ANSWERS_FILE.exists():

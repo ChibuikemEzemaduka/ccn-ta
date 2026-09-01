@@ -128,103 +128,6 @@ with st.sidebar:
         "**New conversation** clears the assistant's memory and starts fresh."
     )
 
-    # ---- Escalated questions (professional sidebar dropdown) --------------
-    # Wrapped in a fragment that auto-reruns every few seconds, so a teaching
-    # staff reply (or a status change) shows up on the student's side on its own,
-    # without them refreshing. The fragment reruns ONLY this panel, so it never
-    # disturbs the student's chat or what they're typing.
-    import datetime as _dt2
-
-    def _fmt_ticket_time(ts):
-        try:
-            return _dt2.datetime.fromisoformat(ts).strftime("%b %d, %I:%M %p")
-        except Exception:
-            return ts or ""
-
-    @st.fragment(run_every="8s")
-    def _escalated_panel():
-        # Apply any reopen submitted on the previous run (button staged it).
-        _reopen_tid = st.session_state.pop("_do_reopen_ticket", None)
-        if _reopen_tid:
-            _reopen_msg = st.session_state.pop("_do_reopen_msg", "").strip()
-            if _reopen_msg:
-                ask.reopen_ticket(_reopen_tid, _reopen_msg)
-                st.session_state["_reopen_flash"] = True
-
-        my_tickets = ask.get_tickets_for_student(student['student_id'])
-        if not my_tickets:
-            return
-        _active = [t for t in my_tickets if t.get("status") in ("open", "reopened")]
-        _answered = [t for t in my_tickets if t.get("status") == "resolved"]
-        unread = sum(1 for r in auth.get_student_replies(student['student_id']) if not r['read'])
-
-        st.divider()
-        _hdr = "🎫 My escalated questions"
-        if unread:
-            _hdr += f"  ({unread} new)"
-        # Open by default whenever the student has any active tickets or a new
-        # reply, so they never miss them.
-        _open = bool(_active) or bool(unread) or st.session_state.pop("_reopen_flash", False)
-        with st.expander(_hdr, expanded=_open):
-            auth.mark_replies_read(student['student_id'])
-            st.caption(f"{len(_active)} awaiting reply · {len(_answered)} answered")
-
-            def _thread_block(t):
-                thread = ask._thread_for_display(t)
-                if not thread:
-                    return
-                for msg in thread:
-                    who = "You" if msg["role"] == "student" else "Teaching staff"
-                    st.markdown(f"<div style='font-size:0.85em;margin:2px 0'>"
-                                f"<b>{who}:</b> {msg['content']}</div>",
-                                unsafe_allow_html=True)
-
-            if _answered:
-                st.markdown("**Answered**")
-                for t in _answered:
-                    with st.container(border=True):
-                        st.markdown(
-                            "<span style='background:#1E7A34;color:#fff;padding:1px 7px;"
-                            "border-radius:10px;font-size:0.72em;'>ANSWERED</span>",
-                            unsafe_allow_html=True)
-                        st.markdown(f"<div style='font-size:0.9em;margin-top:4px'>"
-                                    f"{t['question']}</div>", unsafe_allow_html=True)
-                        st.caption(f"Answered {_fmt_ticket_time(t.get('resolved_time',''))}")
-                        with st.expander("View conversation"):
-                            _thread_block(t)
-                        with st.expander("Ask a follow-up"):
-                            rk = f"reopen_msg_{t['id']}"
-                            st.text_area("Your follow-up", key=rk, height=70,
-                                         placeholder="What's still unclear?",
-                                         label_visibility="collapsed")
-                            if st.button("Send & reopen", key=f"reopen_btn_{t['id']}",
-                                         width='stretch'):
-                                msg = st.session_state.get(rk, "").strip()
-                                if msg:
-                                    st.session_state["_do_reopen_ticket"] = t["id"]
-                                    st.session_state["_do_reopen_msg"] = msg
-                                    st.rerun()   # full rerun: ticket state changed
-                                else:
-                                    st.warning("Type your follow-up first.")
-
-            if _active:
-                st.markdown("**Awaiting reply**")
-                for t in _active:
-                    reop = t.get("status") == "reopened"
-                    with st.container(border=True):
-                        st.markdown(
-                            "<span style='background:#B26A00;color:#fff;padding:1px 7px;"
-                            "border-radius:10px;font-size:0.72em;'>PENDING</span>",
-                            unsafe_allow_html=True)
-                        st.markdown(f"<div style='font-size:0.9em;margin-top:4px'>"
-                                    f"{t['question']}</div>", unsafe_allow_html=True)
-                        st.caption(f"Escalated {_fmt_ticket_time(t.get('time',''))}"
-                                   + (" · reopened" if reop else ""))
-                        with st.expander("View conversation"):
-                            _thread_block(t)
-
-    _escalated_panel()
-
 # ---- 4. Session state ------------------------------------------------------
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -301,6 +204,97 @@ if st.session_state.session_phase == "awaiting_rating":
         _mid = _msg_id(_j, _m)
         if f"flow_{_mid}" not in st.session_state:
             st.session_state[f"flow_{_mid}"] = {"stage": "rating"}
+
+# ---- 5b. My escalated questions (main page, above the chat) ---------------
+# A professional dropdown showing the student's escalated tickets: pending and
+# answered, each with the full conversation and a reopen option. Placed here in
+# the main area (above the conversation) so it's always visible, not tucked in a
+# sidebar the student might have collapsed.
+import datetime as _dt2
+
+def _fmt_ticket_time(ts):
+    try:
+        return _dt2.datetime.fromisoformat(ts).strftime("%b %d, %I:%M %p")
+    except Exception:
+        return ts or ""
+
+# Apply any reopen submitted on the previous run (staged by the button below).
+_reopen_tid = st.session_state.pop("_do_reopen_ticket", None)
+if _reopen_tid:
+    _reopen_msg = st.session_state.pop("_do_reopen_msg", "").strip()
+    if _reopen_msg:
+        ask.reopen_ticket(_reopen_tid, _reopen_msg)
+        st.session_state["_reopen_flash"] = True
+
+_my_tickets = ask.get_tickets_for_student(student['student_id'])
+if _my_tickets:
+    _active = [t for t in _my_tickets if t.get("status") in ("open", "reopened")]
+    _answered = [t for t in _my_tickets if t.get("status") == "resolved"]
+    _unread = sum(1 for r in auth.get_student_replies(student['student_id']) if not r['read'])
+
+    _hdr = f"🎫 My escalated questions — {len(_active)} awaiting reply · {len(_answered)} answered"
+    if _unread:
+        _hdr += f"   •   {_unread} new repl" + ("ies" if _unread != 1 else "y")
+    _open = bool(_active) or bool(_unread) or st.session_state.pop("_reopen_flash", False)
+
+    with st.expander(_hdr, expanded=_open):
+        auth.mark_replies_read(student['student_id'])
+
+        def _thread_block(t):
+            thread = ask._thread_for_display(t)
+            if not thread:
+                return
+            for msg in thread:
+                role = "user" if msg["role"] == "student" else "assistant"
+                who = "You" if msg["role"] == "student" else "Teaching staff"
+                with st.chat_message(role):
+                    st.markdown(f"**{who}:** {msg['content']}")
+
+        if _answered:
+            st.markdown("##### ✅ Answered")
+            for t in _answered:
+                with st.container(border=True):
+                    hc = st.columns([0.82, 0.18])
+                    hc[0].markdown(f"**{t['question']}**")
+                    hc[1].markdown(
+                        "<div style='text-align:right'><span style='background:#1E7A34;"
+                        "color:#fff;padding:2px 9px;border-radius:11px;font-size:0.72em;'>"
+                        "ANSWERED</span></div>", unsafe_allow_html=True)
+                    st.caption(f"Escalated {_fmt_ticket_time(t.get('time',''))}  ·  "
+                               f"answered {_fmt_ticket_time(t.get('resolved_time',''))}")
+                    with st.expander("View full conversation"):
+                        _thread_block(t)
+                    with st.expander("Still unclear? Ask a follow-up"):
+                        rk = f"reopen_msg_{t['id']}"
+                        st.text_area("Your follow-up question for the teaching staff",
+                                     key=rk, height=80,
+                                     placeholder="Explain what still isn't clear…")
+                        if st.button("↩️ Send follow-up & reopen", key=f"reopen_btn_{t['id']}"):
+                            msg = st.session_state.get(rk, "").strip()
+                            if msg:
+                                st.session_state["_do_reopen_ticket"] = t["id"]
+                                st.session_state["_do_reopen_msg"] = msg
+                                st.rerun()
+                            else:
+                                st.warning("Type your follow-up question first.")
+
+        if _active:
+            st.markdown("##### ⏳ Awaiting a teaching staff reply")
+            for t in _active:
+                reop = t.get("status") == "reopened"
+                with st.container(border=True):
+                    hc = st.columns([0.82, 0.18])
+                    hc[0].markdown(f"**{t['question']}**")
+                    hc[1].markdown(
+                        "<div style='text-align:right'><span style='background:#B26A00;"
+                        "color:#fff;padding:2px 9px;border-radius:11px;font-size:0.72em;'>"
+                        "PENDING</span></div>", unsafe_allow_html=True)
+                    st.caption(f"Escalated {_fmt_ticket_time(t.get('time',''))}"
+                               + ("  ·  reopened with a follow-up" if reop else "")
+                               + "  ·  not yet answered")
+                    with st.expander("View full conversation"):
+                        _thread_block(t)
+    st.divider()
 
 # ---- 6. Conversation render -----------------------------------------------
 for i, message in enumerate(st.session_state.messages):

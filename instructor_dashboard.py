@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 import ask
 import auth
 import add_homework
+import ingest
 import generate_variants as gv
 import theme
 import llm_client
@@ -1326,7 +1327,29 @@ with tab_variants:
             else:
                 st.session_state.variant_hw_images = []
         if sol_file:
-            st.session_state.variant_sol_text = _extract_text(sol_file)
+            _raw_sol = _extract_text(sol_file)
+            _sol = None
+            if client is not None and sol_file.name.lower().endswith(".pdf") \
+               and getattr(client, "MODEL_SUPPORTS_VISION", False):
+                # 1. VISION: read the solution PDF pages directly.
+                try:
+                    _contents = [{
+                        "role": "user",
+                        "text": ("The attached PDF is an official homework solution. "
+                                 "Read the pages, including any figures, and produce "
+                                 "the faithful text version."),
+                        "attachments": [{"bytes": sol_file.getvalue(),
+                                         "mime_type": "application/pdf"}],
+                    }]
+                    _sol = client.generate(client.TUTOR_MODEL,
+                                           ingest.SOLUTION_VISION_INSTRUCTION,
+                                           _contents, temperature=0.0).strip() or None
+                except Exception:
+                    _sol = None
+            # 2. LLM cleanup of extracted text.  3. Raw text.
+            if not _sol and client is not None:
+                _sol = ingest.llm_clean_solution(_raw_sol, client)
+            st.session_state.variant_sol_text = _sol or _raw_sol
 
         hw_text  = st.session_state.get("variant_hw_text",  "")
         sol_text = st.session_state.get("variant_sol_text", "")
