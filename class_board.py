@@ -23,8 +23,7 @@ import theme
 theme.inject_theme()
 theme.render_header("CLASS BOARD")
 
-st.markdown("Questions and answers published by the teaching staff for the whole class. "
-            "All questions appear anonymously regardless of who originally asked them.")
+st.markdown("Questions and answers published by the teaching staff for the whole class.")
 
 board = auth.load_public_board()
 
