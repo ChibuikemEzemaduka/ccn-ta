@@ -205,6 +205,20 @@ with tab_tickets:
             "class board so all students benefit."
         )
 
+    # Auto-refresh watcher: every few seconds this small fragment re-counts the
+    # open tickets; if a new one arrived (or a reply changed the count) it reruns
+    # the whole tab so the new escalation shows up without a manual refresh. It
+    # renders nothing itself, so it never disturbs the reply forms below.
+    @st.fragment(run_every="8s")
+    def _tickets_autorefresh():
+        current = len([t for t in ask.load_tickets() if t["status"] in ("open", "reopened")])
+        prev = st.session_state.get("_open_ticket_count")
+        if prev is not None and current != prev:
+            st.session_state["_open_ticket_count"] = current
+            st.rerun()   # full rerun so the ticket list rebuilds with the change
+        st.session_state["_open_ticket_count"] = current
+    _tickets_autorefresh()
+
     open_tickets = [t for t in ask.load_tickets() if t["status"] in ("open", "reopened")]
 
     if not open_tickets:
@@ -741,6 +755,16 @@ with tab_upload:
         st.markdown("---")
         st.markdown(f"**Queue — {len(queue)} file(s) ready to save**")
 
+        # Prominent overwrite warning if any queued file already exists on disk.
+        _will_overwrite = [item["std_name"] for item in queue if item["exists"]]
+        if _will_overwrite:
+            st.warning(
+                "⚠️ **Overwrite warning:** the following file(s) already exist on disk "
+                "and **will be replaced** when you save:  \n"
+                + ", ".join(f"`{n}`" for n in _will_overwrite)
+                + "  \nRemove any you did not intend to overwrite before saving."
+            )
+
         to_remove = []
         for idx, item in enumerate(queue):
             c_name, c_flag, c_rm = st.columns([4, 2, 1])
@@ -748,7 +772,7 @@ with tab_upload:
             c_name.markdown(f"{icon} `{item['std_name']}`")
             c_name.caption(f"{item['mat_type']}  ·  {item['year']}")
             if item["exists"]:
-                c_flag.caption("Will overwrite existing file")
+                c_flag.markdown("**Will overwrite**")
             else:
                 c_flag.caption("New file")
             if c_rm.button("✕", key=f"rm_{idx}_{item['std_name']}", help="Remove from queue"):
@@ -772,14 +796,35 @@ with tab_upload:
                     saved.append(item["std_name"])
             st.session_state.upload_queue = []
             _rescan_if_homework(saved)
-            st.success(f"Saved {len(saved)} file(s): " + ", ".join(f"`{n}`" for n in saved))
-            if skipped:
-                st.info("Skipped: " + ", ".join(f"`{n}`" for n in skipped))
+            st.session_state._upload_saved_msg = saved
+            st.session_state._upload_skipped_msg = skipped
+            if saved:
+                # Flag that new material landed on disk but isn't in the index
+                # yet, so the instructor gets a clear prompt to rebuild.
+                st.session_state._needs_index_update = True
             st.rerun()
 
         if col_clear.button("🗑️ Clear all"):
             st.session_state.upload_queue = []
             st.rerun()
+
+    # Post-save feedback + the prompt to update the index (survives the rerun).
+    if "_upload_saved_msg" in st.session_state:
+        _saved = st.session_state.pop("_upload_saved_msg")
+        _skipped = st.session_state.pop("_upload_skipped_msg", [])
+        if _saved:
+            st.success(f"Saved {len(_saved)} file(s): " + ", ".join(f"`{n}`" for n in _saved))
+        if _skipped:
+            st.info("Skipped: " + ", ".join(f"`{n}`" for n in _skipped))
+
+    if st.session_state.get("_needs_index_update"):
+        st.warning(
+            "🔄 **New material saved — update the index to make it searchable.**  \n"
+            "The file(s) are on disk, but the module cannot see or cite them until "
+            "the index is rebuilt. Go to **Index management** below and run "
+            "**Update index (add / change only)** (fast — processes only new/changed "
+            "files), or **Reset and rebuild** for a full clean rebuild."
+        )
 
     # ── materials browser (index-driven) ──────────────────────────────────────
     st.markdown("---")
@@ -965,8 +1010,32 @@ with tab_upload:
             for y, tlabel, fname, fsize in sorted(not_indexed_any):
                 st.caption(f"  {y} · {tlabel} · `{fname}` ({_fmt_size(fsize)})")
     else:
-        # ── Single-year detail: per-file, per-category ───────────────────────
+        # ── Single-year detail: per-file, per-category, with delete ──────────
         y = int(browse_year)
+
+        # Handle a confirmed delete from a previous run (staged by the button).
+        _del_path = st.session_state.pop("_confirm_delete_path", None)
+        if _del_path:
+            try:
+                p = Path(_del_path)
+                if p.exists():
+                    p.unlink()
+                    st.session_state._deleted_msg = p.name
+                    # The deleted file may still be in the index until a rebuild.
+                    st.session_state._needs_index_update = True
+            except Exception as _e:
+                st.session_state._delete_error = str(_e)
+            st.rerun()
+
+        if "_deleted_msg" in st.session_state:
+            st.success(f"Deleted `{st.session_state.pop('_deleted_msg')}` from disk. "
+                       "Run **Reset and rebuild** below so the module stops referencing it.")
+        if "_delete_error" in st.session_state:
+            st.error(f"Could not delete the file: {st.session_state.pop('_delete_error')}")
+
+        st.caption("Files on disk can be deleted here. Deleting removes the file from "
+                   "disk; rebuild the index afterwards so the module stops citing it.")
+
         any_shown = False
         for t in types_to_show:
             idx_files = indexed.get(t, {}).get(y, {})
@@ -976,22 +1045,49 @@ with tab_upload:
             any_shown = True
             st.markdown(f"**{TYPE_LABELS[t]}**")
 
-            # Indexed files (searchable) — the real source of truth
-            for fname in sorted(idx_files.keys()):
-                chunks = idx_files[fname]
+            # Every standard-named file for this type/year (on disk and/or indexed)
+            all_files = sorted(set(disk_files) | set(idx_files))
+            for fname in all_files:
                 on_disk = fname in disk_files
-                size_txt = f" · {_fmt_size(disk_files[fname])}" if on_disk else ""
-                st.caption(f"✅ `{fname}` · {chunks} chunk(s){size_txt}  ·  indexed")
+                is_indexed = fname in idx_files
+                sub = DISK_SUBFOLDERS[t]
+                full_path = f"materials/{y}/{sub}/{fname}"
 
-            # Files on disk but not indexed — need attention
-            not_idx = [f for f in disk_files if f not in idx_files]
-            for fname in sorted(not_idx):
-                st.caption(f"⚠️ `{fname}` · {_fmt_size(disk_files[fname])}  ·  "
-                           "on disk, NOT indexed — rebuild or check for extractable text")
+                fcol, dcol = st.columns([5, 1])
+                if is_indexed and on_disk:
+                    chunks = idx_files[fname]
+                    fcol.caption(f"✅ `{fname}` · {chunks} chunk(s) · "
+                                 f"{_fmt_size(disk_files[fname])}  ·  indexed")
+                elif is_indexed and not on_disk:
+                    chunks = idx_files[fname]
+                    fcol.caption(f"📄 `{fname}` · {chunks} chunk(s)  ·  indexed "
+                                 "(not on disk — will disappear on next rebuild)")
+                else:  # on disk, not indexed
+                    fcol.caption(f"⚠️ `{fname}` · {_fmt_size(disk_files[fname])}  ·  "
+                                 "on disk, NOT indexed — rebuild to include it")
+
+                # Delete button only for files that are actually on disk.
+                if on_disk:
+                    dkey = f"del_{y}_{t}_{fname}"
+                    ckey = f"delconfirm_{y}_{t}_{fname}"
+                    if st.session_state.get(ckey):
+                        # Confirmation state: show confirm/cancel.
+                        if dcol.button("Confirm", key=f"{dkey}_yes", type="primary"):
+                            st.session_state._confirm_delete_path = full_path
+                            st.session_state.pop(ckey, None)
+                            st.rerun()
+                        if dcol.button("Cancel", key=f"{dkey}_no"):
+                            st.session_state.pop(ckey, None)
+                            st.rerun()
+                    else:
+                        if dcol.button("🗑️", key=dkey, help=f"Delete {fname} from disk"):
+                            st.session_state[ckey] = True
+                            st.rerun()
 
             all_std   = set(disk_files) | set(idx_files)
             n_on_disk = len(disk_files)
             n_indexed = sum(1 for f in all_std if f in idx_files)
+            not_idx = [f for f in disk_files if f not in idx_files]
             summary = f"{n_on_disk} standard file(s) on disk · {n_indexed} indexed"
             if len(not_idx):
                 summary += f" · {len(not_idx)} not yet indexed"
@@ -1060,6 +1156,7 @@ with tab_upload:
             add_homework.scan_folder(use_llm=True, incremental=incremental)
             st.cache_resource.clear()
             ask.reset_solutions_cache()   # drop stale collection handle after rebuild
+            st.session_state.pop("_needs_index_update", None)  # prompt satisfied
 
         status = st.status("Running...", expanded=True)
         bar = st.progress(0.0)

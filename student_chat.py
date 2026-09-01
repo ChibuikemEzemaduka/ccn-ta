@@ -128,6 +128,10 @@ with st.sidebar:
     )
 
     # ---- Escalated questions (professional sidebar dropdown) --------------
+    # Wrapped in a fragment that auto-reruns every few seconds, so a teaching
+    # staff reply (or a status change) shows up on the student's side on its own,
+    # without them refreshing. The fragment reruns ONLY this panel, so it never
+    # disturbs the student's chat or what they're typing.
     import datetime as _dt2
 
     def _fmt_ticket_time(ts):
@@ -136,16 +140,19 @@ with st.sidebar:
         except Exception:
             return ts or ""
 
-    # Apply any reopen submitted on the previous run (button staged it).
-    _reopen_tid = st.session_state.pop("_do_reopen_ticket", None)
-    if _reopen_tid:
-        _reopen_msg = st.session_state.pop("_do_reopen_msg", "").strip()
-        if _reopen_msg:
-            ask.reopen_ticket(_reopen_tid, _reopen_msg)
-            st.session_state["_reopen_flash"] = True
+    @st.fragment(run_every="8s")
+    def _escalated_panel():
+        # Apply any reopen submitted on the previous run (button staged it).
+        _reopen_tid = st.session_state.pop("_do_reopen_ticket", None)
+        if _reopen_tid:
+            _reopen_msg = st.session_state.pop("_do_reopen_msg", "").strip()
+            if _reopen_msg:
+                ask.reopen_ticket(_reopen_tid, _reopen_msg)
+                st.session_state["_reopen_flash"] = True
 
-    my_tickets = ask.get_tickets_for_student(student['student_id'])
-    if my_tickets:
+        my_tickets = ask.get_tickets_for_student(student['student_id'])
+        if not my_tickets:
+            return
         _active = [t for t in my_tickets if t.get("status") in ("open", "reopened")]
         _answered = [t for t in my_tickets if t.get("status") == "resolved"]
         unread = sum(1 for r in auth.get_student_replies(student['student_id']) if not r['read'])
@@ -154,7 +161,10 @@ with st.sidebar:
         _hdr = "🎫 My escalated questions"
         if unread:
             _hdr += f"  ({unread} new)"
-        with st.expander(_hdr, expanded=bool(unread) or st.session_state.pop("_reopen_flash", False)):
+        # Open by default whenever the student has any active tickets or a new
+        # reply, so they never miss them.
+        _open = bool(_active) or bool(unread) or st.session_state.pop("_reopen_flash", False)
+        with st.expander(_hdr, expanded=_open):
             auth.mark_replies_read(student['student_id'])
             st.caption(f"{len(_active)} awaiting reply · {len(_answered)} answered")
 
@@ -192,7 +202,7 @@ with st.sidebar:
                                 if msg:
                                     st.session_state["_do_reopen_ticket"] = t["id"]
                                     st.session_state["_do_reopen_msg"] = msg
-                                    st.rerun()
+                                    st.rerun()   # full rerun: ticket state changed
                                 else:
                                     st.warning("Type your follow-up first.")
 
@@ -211,6 +221,8 @@ with st.sidebar:
                                    + (" · reopened" if reop else ""))
                         with st.expander("View conversation"):
                             _thread_block(t)
+
+    _escalated_panel()
 
 # ---- 4. Session state ------------------------------------------------------
 if "messages" not in st.session_state:
