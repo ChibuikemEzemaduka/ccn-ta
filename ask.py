@@ -148,6 +148,7 @@ def _operational_files():
         INTERACTIONS_FILE,
         ERROR_LOG_FILE,
         ACCESS_LOG_FILE,
+        Path("sessions.json"),                 # persistent-login tokens
         getattr(_auth, "ROSTER_FILE", Path("students.json")),
         getattr(_auth, "REPLIES_FILE", Path("student_replies.json")),
         getattr(_auth, "PUBLIC_BOARD_FILE", Path("public_board.json")),

@@ -21,6 +21,7 @@ tickets.json
 student_replies.json
 public_board.json
 interactions.json
+sessions.json
 feedback.json
 
 # ── Course content & generated indexes (large / not code) ───────────────────

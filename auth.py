@@ -190,11 +190,145 @@ def authenticate(email: str, password: str) -> bool:
                 reset_password(student["email"], password)
             except Exception:
                 pass   # never block a valid login on a migration hiccup
-        st.session_state[SESSION_KEY] = {
+        identity = {
             "student_id": student["student_id"],
             "name": student["name"],
             "email": student["email"],
         }
+        st.session_state[SESSION_KEY] = identity
+        # Persist a session token in the URL so a page refresh keeps the student
+        # logged in (session_state alone is wiped on refresh).
+        _start_persistent_session("student", identity)
+        return True
+    return False
+
+
+# ---------------------- persistent sessions (survive refresh) ----------------
+# Login state kept only in st.session_state is lost when the user refreshes the
+# page (Streamlit clears session_state on refresh). To keep users logged in
+# across refreshes, we store a random token in the URL query string and map it,
+# server-side, to the account identity plus a last-activity timestamp. On each
+# load we restore the session from the token if it exists and hasn't been idle
+# past the inactivity timeout. Long inactivity => the token expires => logout.
+
+SESSIONS_FILE = Path("sessions.json")
+INACTIVITY_TIMEOUT_SECONDS = 2 * 60 * 60   # 2 hours
+
+
+def _load_sessions() -> dict:
+    if SESSIONS_FILE.exists():
+        try:
+            return _read_json(SESSIONS_FILE) or {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_sessions(sessions: dict):
+    try:
+        SESSIONS_FILE.write_text(json.dumps(sessions, indent=2, ensure_ascii=False),
+                                 encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _prune_sessions(sessions: dict) -> dict:
+    """Drop tokens idle past the inactivity timeout."""
+    import time
+    now = time.time()
+    return {tok: s for tok, s in sessions.items()
+            if now - s.get("last_active", 0) <= INACTIVITY_TIMEOUT_SECONDS}
+
+
+def _start_persistent_session(role: str, identity: dict):
+    """Create a token for this login, store it server-side, and put it in the URL."""
+    import secrets as _secrets
+    import time
+    token = _secrets.token_urlsafe(24)
+    sessions = _prune_sessions(_load_sessions())
+    sessions[token] = {"role": role, "identity": identity,
+                       "last_active": time.time()}
+    _save_sessions(sessions)
+    try:
+        st.query_params["s"] = token
+    except Exception:
+        pass
+
+
+def _touch_session(token: str):
+    """Update a token's last-activity time (called on each page load)."""
+    import time
+    sessions = _load_sessions()
+    if token in sessions:
+        sessions[token]["last_active"] = time.time()
+        _save_sessions(_prune_sessions(sessions))
+
+
+def _resolve_token(token: str, role: str):
+    """Return the identity for a valid, non-expired token of the given role, or
+    None. Prunes expired tokens as a side effect."""
+    if not token:
+        return None
+    import time
+    sessions = _prune_sessions(_load_sessions())
+    _save_sessions(sessions)   # persist the prune
+    s = sessions.get(token)
+    if not s or s.get("role") != role:
+        return None
+    if time.time() - s.get("last_active", 0) > INACTIVITY_TIMEOUT_SECONDS:
+        return None
+    return s.get("identity")
+
+
+def _destroy_token(token: str):
+    sessions = _load_sessions()
+    if token in sessions:
+        sessions.pop(token, None)
+        _save_sessions(sessions)
+
+
+# Instructor-side helpers (the dashboard doesn't use authenticate()).
+def start_instructor_session():
+    """Create a persistent token for an instructor login and put it in the URL."""
+    _start_persistent_session("instructor", {"role": "instructor"})
+
+
+def restore_instructor_session() -> bool:
+    """Return True if the URL carries a valid, non-expired instructor token."""
+    token = st.query_params.get("s")
+    identity = _resolve_token(token, "instructor")
+    if identity:
+        _touch_session(token)
+        return True
+    return False
+
+
+def end_instructor_session():
+    """Invalidate the instructor token and clear it from the URL (log out)."""
+    token = st.query_params.get("s")
+    if token:
+        _destroy_token(token)
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
+
+
+def restore_student_session() -> bool:
+    """If the student isn't in session_state but the URL carries a valid,
+    non-expired token, restore the login. Returns True if now logged in.
+    Called at the top of the student page so a refresh keeps them logged in."""
+    if SESSION_KEY in st.session_state:
+        # Already logged in this run; just keep the token fresh.
+        token = st.query_params.get("s")
+        if token:
+            _touch_session(token)
+        return True
+    token = st.query_params.get("s")
+    identity = _resolve_token(token, "student")
+    if identity:
+        st.session_state[SESSION_KEY] = identity
+        _touch_session(token)
         return True
     return False
 
@@ -205,11 +339,18 @@ def current_student() -> dict | None:
 
 
 def logout():
+    # Invalidate the persistent token too, then clear the URL and session.
+    token = st.query_params.get("s")
+    if token:
+        _destroy_token(token)
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
     st.session_state.pop(SESSION_KEY, None)
     # clear any chat state too so the next student starts fresh
     for key in list(st.session_state.keys()):
-        if key not in (SESSION_KEY,):
-            st.session_state.pop(key, None)
+        st.session_state.pop(key, None)
 
 
 def is_logged_in() -> bool:

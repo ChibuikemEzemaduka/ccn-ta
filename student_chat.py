@@ -17,6 +17,7 @@ theme.inject_theme()
 theme.render_header("STUDENT")
 
 # ---- 1. Authentication gate -----------------------------------------------
+auth.restore_student_session()   # keep login across page refresh (URL token)
 auth.require_login()   # renders login form and calls st.stop() if not logged in
 student = auth.current_student()  # {'student_id', 'name', 'email'}
 

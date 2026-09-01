@@ -67,6 +67,12 @@ def _check_admin(username, password):
 if "instructor_authed" not in st.session_state:
     st.session_state.instructor_authed = False
 
+# Keep the instructor logged in across a page refresh: if session_state was
+# cleared by the refresh but the URL carries a valid, non-expired token, restore
+# the authenticated state.
+if not st.session_state.instructor_authed and auth.restore_instructor_session():
+    st.session_state.instructor_authed = True
+
 if not st.session_state.instructor_authed:
     theme.render_header("TEACHING STAFF", role_color=theme.color("amber"))
     if not ADMIN_USERNAME or not ADMIN_PASSWORD_HASH:
@@ -77,12 +83,20 @@ if not st.session_state.instructor_authed:
     if st.button("Enter", type="primary"):
         if _check_admin(username, pw):
             st.session_state.instructor_authed = True
+            auth.start_instructor_session()   # persist across refresh (URL token)
             st.rerun()
         else:
             st.error("Incorrect username or password.")
     st.stop()
 
 theme.render_header("TEACHING STAFF", role_color=theme.color("amber"))
+
+with st.sidebar:
+    if st.button("Sign out", width='stretch'):
+        auth.end_instructor_session()
+        st.session_state.instructor_authed = False
+        st.rerun()
+
 (tab_students, tab_tickets, tab_analytics,
  tab_homeworks, tab_upload, tab_variants, tab_maintenance) = st.tabs([
     "👥 Students", "🎫 Tickets", "📊 Analytics",
@@ -1102,16 +1116,21 @@ with tab_upload:
     st.markdown("---")
     st.markdown("#### Index management")
     theme.info_button(
-        "Three independent actions:\n\n"
-        "**Delete index only** — wipes `chroma_db/`, `knowledge.json`, and `solutions.json`. "
-        "The module stops being able to answer questions until you rebuild. Useful if you want "
-        "to inspect or reorganise your materials folder before rebuilding.\n\n"
-        "**Reset and rebuild** — deletes the index then immediately rebuilds it from scratch. "
-        "Every chunk is re-embedded, so this takes longer but guarantees a clean index. "
-        "Use this after reorganising or renaming files.\n\n"
-        "**Update index only** — reads your materials folder and adds/updates only what has "
-        "changed since the last build. Existing unchanged embeddings are reused, so it is "
-        "fast. Use this after adding new files."
+        "Three independent actions. All of them cover **every course material** — "
+        "lecture slides, textbook, transcripts, notes, homework **problems**, and "
+        "homework **solutions** — so nothing stale is ever left behind.\n\n"
+        "**Delete index only** — wipes `chroma_db/`, `knowledge.json`, "
+        "`solutions.json`, and `assignments.json` (the homework problems the "
+        "guardrail matches against). The module stops answering and stops "
+        "recognising any homework until you rebuild. Useful to inspect or "
+        "reorganise your materials folder before rebuilding.\n\n"
+        "**Reset and rebuild** — deletes all of the above, then rebuilds "
+        "everything from scratch, re-embedding every chunk and re-parsing every "
+        "homework problem and solution. Slower but guarantees a completely clean "
+        "state. Use after reorganising, renaming, or removing files.\n\n"
+        "**Update index only** — reads your materials folder and adds/updates "
+        "only what changed since the last build (including new or changed "
+        "homework problems and solutions). Fast; use after adding new files."
     )
 
     import build_index as _build_index
@@ -1137,18 +1156,36 @@ with tab_upload:
 
     if "Reset" in idx_action or "Delete" in idx_action:
         st.warning(
-            "This will permanently delete `chroma_db/`, `knowledge.json`, and `solutions.json`. "
-            "Make sure your materials folders are complete before doing a reset+rebuild."
+            "This permanently deletes the whole index and all derived course data: "
+            "`chroma_db/`, `knowledge.json`, `solutions.json`, and `assignments.json` "
+            "(homework problems). The homework guardrail will recognise **no** "
+            "homework until you rebuild. Make sure your materials folders are "
+            "complete before a reset+rebuild."
         )
 
     if st.button("▶ Run", type="primary"):
         import build_index as _bi
 
         def _delete_index():
+            # Remove EVERY piece of indexed/derived course data so nothing stale
+            # survives -- including the homework PROBLEMS in assignments.json,
+            # which the four-layer guardrail (signals -> supervisor -> tutor ->
+            # reviewer) matches against. Leaving it behind would let the module
+            # activate homework mode on problems that no longer exist.
             if db_path.exists(): _shutil.rmtree(db_path)
-            for f in [kj, sj, Path("parse_cache.json"),
+            for f in [kj, sj,
+                      Path("assignments.json"),          # homework PROBLEMS (guardrail source)
+                      Path("parse_cache.json"),
                       Path("homework_parse_cache.json")]:
                 if f.exists(): f.unlink()
+            # Drop cached indexes/handles so the next page load reads fresh data
+            # (the student page keys its assignment-match index on a fingerprint
+            # of assignments.json, so an empty file yields an empty guardrail).
+            try:
+                st.cache_resource.clear()
+            except Exception:
+                pass
+            ask.reset_solutions_cache()
 
         def _run_build(progress_fn, incremental=True):
             _ingest.main(incremental=incremental)
