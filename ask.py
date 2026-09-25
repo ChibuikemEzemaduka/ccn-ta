@@ -63,6 +63,7 @@ TICKETS_FILE = Path("tickets.json")
 FEEDBACK_FILE = Path("feedback.json")
 INSTRUCTOR_ANSWERS_FILE = Path("instructor_answers.json")
 INTERACTIONS_FILE = Path("interactions.json")
+CONVERSATIONS_FILE = Path("conversations.json")  # ANONYMOUS full chats (no student identity)
 ERROR_LOG_FILE = Path("error_log.json")      # anonymous: timestamp + prompt only
 ACCESS_LOG_FILE = Path("access_log.json")    # identifies account (login/duration)
 
@@ -146,6 +147,7 @@ def _operational_files():
         TICKETS_FILE,
         FEEDBACK_FILE,
         INTERACTIONS_FILE,
+        CONVERSATIONS_FILE,                    # anonymous full chats
         ERROR_LOG_FILE,
         ACCESS_LOG_FILE,
         Path("sessions.json"),                 # persistent-login tokens
@@ -1221,6 +1223,89 @@ def _interactions_by_week():
         buckets.setdefault(key, []).append(it)
         labels[key] = label
     weeks = sorted(buckets.keys(), reverse=True)
+    return [(k, labels[k], buckets[k]) for k in weeks]
+
+
+# --- Anonymous full-conversation log (instructor review) ----------------------
+# interactions.json is anonymous and per-Q&A, and drives the weekly LLM insights.
+# This SEPARATE log keeps each COMPLETE threaded conversation so the instructor
+# can read every full chat themselves in the Analytics tab. Like the rest of the
+# analytics data, it is ANONYMOUS by design: it stores NO student identity -- no
+# name, no email, and no student_id -- so a stored chat can never be linked back
+# to a specific student. The conversation_id passed in must itself be a random,
+# identity-free token (see student_chat.py), not derived from the student.
+def log_conversation(conversation_id, messages):
+    """Create or update the anonymous record of one chat session.
+
+    conversation_id: a random, identity-free id, stable for one chat session (a
+                     new one is minted when the student starts a New
+                     conversation). It must NOT encode the student's identity.
+    messages:        the full st.session_state.messages list. We re-write the
+                     whole conversation each turn (idempotent on conversation_id),
+                     so the stored record always mirrors the live thread as it
+                     grows. Best-effort: logging must never break the chat.
+
+    Only user/assistant turns with real content are kept, along with each
+    assistant turn's homework/flagged markers so the instructor can see at a
+    glance where the guardrail engaged or coverage was low. NO student name,
+    email, or id is ever stored here.
+    """
+    try:
+        turns = []
+        for m in messages or []:
+            role = m.get("role")
+            content = (m.get("content") or "").strip()
+            if role not in ("user", "assistant") or not content:
+                continue
+            turn = {"role": role, "content": content}
+            if role == "assistant":
+                turn["homework_on"] = bool(m.get("homework_on"))
+                turn["flagged"] = bool(m.get("flagged"))
+            turns.append(turn)
+        if not turns:
+            return   # nothing meaningful to store yet
+
+        convos = _read_json(CONVERSATIONS_FILE) if CONVERSATIONS_FILE.exists() else []
+        now = _now()
+        existing = next((c for c in convos if c.get("id") == conversation_id), None)
+        if existing:
+            existing["turns"] = turns
+            existing["turn_count"] = len(turns)
+            existing["last_time"] = now
+            # Defensively strip any identity that might have been stored by an
+            # older build, so re-writing an existing record scrubs it.
+            for k in ("student_id", "student_name", "student_email"):
+                existing.pop(k, None)
+        else:
+            convos.append({
+                "id": conversation_id,
+                "started": now,
+                "last_time": now,
+                "turn_count": len(turns),
+                "turns": turns,
+            })
+        CONVERSATIONS_FILE.write_text(
+            json.dumps(convos, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass   # never let conversation logging break a student's chat
+
+
+def _conversations_by_week():
+    """Group stored (anonymous) full conversations into calendar weeks (by when
+    each chat started). Returns an ordered list of (week_key, label,
+    [conversations]), newest week first, and within each week the most recently
+    active chat first."""
+    convos = _read_json(CONVERSATIONS_FILE) if CONVERSATIONS_FILE.exists() else []
+    buckets, labels = {}, {}
+    for c in convos:
+        key, label = _week_key(c.get("started") or c.get("last_time") or "")
+        if not key:
+            continue
+        buckets.setdefault(key, []).append(c)
+        labels[key] = label
+    weeks = sorted(buckets.keys(), reverse=True)
+    for k in weeks:
+        buckets[k].sort(key=lambda c: c.get("last_time", ""), reverse=True)
     return [(k, labels[k], buckets[k]) for k in weeks]
 
 

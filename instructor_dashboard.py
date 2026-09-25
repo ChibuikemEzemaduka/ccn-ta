@@ -409,35 +409,71 @@ with tab_analytics:
     _h[0].subheader("Where students struggle")
     with _h[1]:
         theme.info_button(
-            "Questions grouped by meaning so paraphrases land together. "
-            "Groups asked more than once with high struggle rate are pacing concerns."
+            "Read every complete conversation, grouped by week, so you can go "
+            "through them yourself. Below that, an LLM summarizes each week's "
+            "questions into a short insight. All of this analytics data is "
+            "ANONYMOUS: conversations carry no student name, email, or id and "
+            "can never be linked back to a specific student."
         )
-    threshold = st.slider("Clustering strictness", 0.30, 0.65, 0.45, 0.01)
-    analytics = ask.build_analytics(cluster_threshold=threshold)
+
+    analytics = ask.build_analytics()
     c1, c2, c3 = st.columns(3)
     c1.metric("Questions asked", analytics["total_questions"])
     c2.metric("Ratings given", analytics["total_rated"])
     c3.metric("Open tickets", len(analytics["open_tickets"]))
-    if not analytics["clusters"]:
-        st.info("Not enough data yet.")
-    else:
-        hotspots = [c for c in analytics["clusters"]
-                    if c["struggle_rate"] and c["struggle_rate"] >= 0.5 and c["asked_count"] >= 2]
-        if hotspots:
-            st.markdown("#### ⚠️ Possible pacing concerns")
-            for c in sorted(hotspots, key=lambda c: c["asked_count"], reverse=True):
-                st.warning(f'**{c["representative"]}** — asked {c["asked_count"]}×, '
-                           f'{c["struggle_rate"]:.0%} struggled, {c["escalated_count"]} escalated')
-        st.markdown("#### All topics, by volume")
-        for c in sorted(analytics["clusters"], key=lambda c: c["asked_count"], reverse=True):
-            sl = f'{c["struggle_rate"]:.0%} struggled' if c["struggle_rate"] is not None else "not yet rated"
-            hw = " · 🎓 homework" if c["homework_share"] >= 0.5 else ""
-            with st.expander(f'**{c["asked_count"]}×**  {c["representative"][:90]}  ·  {sl}{hw}'):
-                st.markdown(f'Re-explained: {c["reexplained_count"]}  ·  Escalated: {c["escalated_count"]}')
-                for q in c["sample_questions"]:
-                    st.markdown(f"- {q}")
 
-    # ── Weekly LLM insights (sits alongside the clustering above) ────────────
+    # ── Read full conversations, by week (ANONYMOUS) ─────────────────────────
+    st.divider()
+    st.markdown("### 💬 Read full conversations")
+    st.caption("Every complete chat a student had with the assistant, grouped by "
+               "the week it started — read through them yourself. Conversations "
+               "are anonymous: no name or email is stored, so they cannot be tied "
+               "to a student. 🎓 marks a chat where homework-guidance mode "
+               "engaged; ⚠️ marks one where course-material coverage was low.")
+
+    conv_weeks = ask._conversations_by_week()
+    if not conv_weeks:
+        st.info("No conversations logged yet. Full chats appear here as students "
+                "use the assistant.")
+    else:
+        week_keys = [k for k, _, _ in conv_weeks]
+        week_meta = {k: (label, convos) for k, label, convos in conv_weeks}
+
+        chosen_week = st.selectbox(
+            "Week",
+            week_keys,
+            format_func=lambda k: f"{week_meta[k][0]}  ·  {len(week_meta[k][1])} chat(s)",
+            key="conv_week",
+        )
+        week_convos = week_meta[chosen_week][1]
+
+        st.caption(f"{len(week_convos)} conversation(s) this week.")
+
+        for pos, c in enumerate(week_convos, start=1):
+            turns = c.get("turns", [])
+            q_count = sum(1 for t in turns if t.get("role") == "user")
+            has_hw = any(t.get("homework_on") for t in turns
+                         if t.get("role") == "assistant")
+            has_flag = any(t.get("flagged") for t in turns
+                           if t.get("role") == "assistant")
+            tags = ""
+            if has_hw:
+                tags += "  ·  🎓 homework"
+            if has_flag:
+                tags += "  ·  ⚠️ low coverage"
+            started = _fmt_time(c.get("started", ""))
+            header = (f'**Conversation {pos}**  ·  {started}  ·  '
+                      f'{q_count} question{"s" if q_count != 1 else ""}{tags}')
+            with st.expander(header):
+                if c.get("last_time") and c.get("last_time") != c.get("started"):
+                    st.caption(f"Last message {_fmt_time(c['last_time'])}")
+                with st.container(border=True):
+                    for t in turns:
+                        role = "user" if t.get("role") == "user" else "assistant"
+                        with st.chat_message(role):
+                            st.markdown(t.get("content", ""))
+
+    # ── Weekly LLM insights (anonymous — sits below the conversation reader) ──
     st.divider()
     _wh = st.columns([0.75, 0.25])
     _wh[0].markdown("### 🗓️ Weekly insights")

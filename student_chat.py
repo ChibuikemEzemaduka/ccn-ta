@@ -110,7 +110,8 @@ with st.sidebar:
     if st.button("🔄 New conversation", width='stretch'):
         for k in ["messages","guard_session","session_phase",
                   "pending_confusion_context","pending_question","pending_attachments",
-                  "pending_inference","stop_requested","resume_phase"]:
+                  "pending_inference","stop_requested","resume_phase",
+                  "conversation_id"]:   # drop the id so a fresh chat logs separately
             st.session_state.pop(k, None)
         # also clear per-message flow keys
         for k in [k for k in st.session_state.keys() if k.startswith("flow_")]:
@@ -131,6 +132,14 @@ with st.sidebar:
 # ---- 4. Session state ------------------------------------------------------
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "conversation_id" not in st.session_state:
+    # A session-stable, RANDOM id for THIS chat, so the anonymous conversation
+    # log (read only by the instructor) can update one growing record per chat
+    # instead of scattering turns. It is deliberately NOT derived from the
+    # student's identity -- the analytics conversation log must never be linkable
+    # to a student's name or email. A new id is minted after "New conversation".
+    import uuid as _uuid_conv
+    st.session_state.conversation_id = f"c-{_uuid_conv.uuid4().hex}"
 if "guard_session" not in st.session_state:
     st.session_state.guard_session = {}
 if "session_phase" not in st.session_state:
@@ -486,6 +495,14 @@ if phase == "thinking":
         "msg_id": new_msg_id,
     })
     st.session_state[f"flow_{new_msg_id}"] = {"stage": "rating"}
+
+    # Persist the FULL conversation for the instructor to read in the Analytics
+    # tab. Like all analytics data it is ANONYMOUS: the whole thread is kept, but
+    # no student name, email, or id is stored (the conversation_id is random).
+    # Best-effort — a logging failure never interrupts the chat.
+    ask.log_conversation(st.session_state.conversation_id,
+                         st.session_state.messages)
+
     st.session_state.pending_inference = None
     st.session_state.pop("resume_phase", None)
     st.session_state.session_phase = "awaiting_rating"
