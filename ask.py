@@ -1309,6 +1309,73 @@ def _conversations_by_week():
     return [(k, labels[k], buckets[k]) for k in weeks]
 
 
+def backfill_conversations_from_interactions():
+    """Import HISTORICAL anonymous Q&A (interactions.json) into the conversation
+    reader, so past activity is viewable alongside new full conversations.
+
+    Past interactions were only ever stored as individual question/reply pairs
+    with no thread linkage, so each is imported as a single-exchange conversation
+    (one student turn + one assistant turn), grouped by its own timestamp/week.
+    Conversations logged going forward are true multi-turn threads and are left
+    untouched.
+
+    Idempotent and safe to call on every dashboard load:
+      - It only writes when it actually imports something new.
+      - It skips any interaction it has already imported (deterministic id).
+      - It only imports interactions that occurred BEFORE the earliest LIVE
+        (natively-logged) conversation. Interactions after that point are already
+        captured inside a live thread, so importing them would double-count.
+
+    Returns the number of historical conversations newly imported.
+    """
+    interactions = _read_json(INTERACTIONS_FILE) if INTERACTIONS_FILE.exists() else []
+    if not interactions:
+        return 0
+    convos = _read_json(CONVERSATIONS_FILE) if CONVERSATIONS_FILE.exists() else []
+
+    # Cutoff: the earliest start time among LIVE (non-backfilled) conversations.
+    # Any interaction at or after this is already part of a live thread.
+    live_starts = [c.get("started") for c in convos
+                   if not c.get("backfilled") and c.get("started")]
+    cutoff = min(live_starts) if live_starts else None
+
+    existing_ids = {c.get("id") for c in convos}
+    added = 0
+    for it in interactions:
+        t = it.get("time", "")
+        if cutoff and t and t >= cutoff:
+            continue                       # already inside a live conversation
+        conv_id = f"conv-hist-{it.get('id')}"
+        if conv_id in existing_ids:
+            continue                       # already imported
+        q = (it.get("question") or "").strip()
+        r = (it.get("reply") or "").strip()
+        turns = []
+        if q:
+            turns.append({"role": "user", "content": q})
+        if r:
+            turns.append({"role": "assistant", "content": r,
+                          "homework_on": bool(it.get("homework_on")),
+                          "flagged": bool(it.get("flagged"))})
+        if not turns:
+            continue
+        convos.append({
+            "id": conv_id,
+            "backfilled": True,            # single-exchange import from history
+            "started": t or _now(),
+            "last_time": t or _now(),
+            "turn_count": len(turns),
+            "turns": turns,
+        })
+        existing_ids.add(conv_id)
+        added += 1
+
+    if added:
+        CONVERSATIONS_FILE.write_text(
+            json.dumps(convos, indent=2, ensure_ascii=False), encoding="utf-8")
+    return added
+
+
 def _week_data_hash(items):
     """A stable hash of a week's interactions, so a stored summary is reused
     unless that week's data actually changed (new questions arrived)."""

@@ -431,6 +431,13 @@ with tab_analytics:
                "to a student. 🎓 marks a chat where homework-guidance mode "
                "engaged; ⚠️ marks one where course-material coverage was low.")
 
+    # Import any historical Q&A (from the anonymous interaction log) into the
+    # reader on load. Idempotent and only writes when something new is found, so
+    # past activity shows up here alongside new full conversations.
+    _imported = ask.backfill_conversations_from_interactions()
+    if _imported:
+        st.caption(f"Imported {_imported} past exchange(s) from the question log.")
+
     conv_weeks = ask._conversations_by_week()
     if not conv_weeks:
         st.info("No conversations logged yet. Full chats appear here as students "
@@ -465,6 +472,9 @@ with tab_analytics:
             header = (f'**Conversation {pos}**  ·  {started}  ·  '
                       f'{q_count} question{"s" if q_count != 1 else ""}{tags}')
             with st.expander(header):
+                if c.get("backfilled"):
+                    st.caption("Imported from the question log — a single exchange. "
+                               "Full multi-turn threads apply to chats from now on.")
                 if c.get("last_time") and c.get("last_time") != c.get("started"):
                     st.caption(f"Last message {_fmt_time(c['last_time'])}")
                 with st.container(border=True):
