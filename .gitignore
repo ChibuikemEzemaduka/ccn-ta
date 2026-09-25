@@ -13,6 +13,7 @@
 *.pem
 *.crt
 *.cer
+*.json
 
 # ── Student & teaching-staff data (FERPA-sensitive) ─────────────────────────
 students.json
@@ -23,6 +24,12 @@ public_board.json
 interactions.json
 sessions.json
 feedback.json
+conversations.json
+access_log.json
+weekly_analytics.json
+error_log.json
+ingest_report.json
+instructor_answers.json
 
 # ── Course content & generated indexes (large / not code) ───────────────────
 materials/
