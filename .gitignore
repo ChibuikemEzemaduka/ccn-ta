@@ -27,6 +27,7 @@ conversations.json
 access_log.json
 weekly_analytics.json
 error_log.json
+ingest_report.json
 
 # ── Course content & generated indexes (large / not code) ───────────────────
 materials/
